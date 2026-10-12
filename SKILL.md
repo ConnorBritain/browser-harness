@@ -59,6 +59,7 @@ PY
 
 ## Page Workflow
 
+- Helpers, already imported: `new_tab(url)`, `goto_url(url)`, `wait_for_load()`, `page_info()`, `js(expression)`, `cdp(method, **params)`, `click_at_xy(x, y)`, `type_text(text)`, `fill_input(selector, text)`, `press_key(key)`, `scroll(x, y, dy=-300)`, `wait_for_element(selector)`, `capture_screenshot(path, full=False)`, `list_tabs()`, `switch_tab(target)`, `upload_file(selector, path)`. There is no `screenshot()`.
 - Prefer to find elements with the accessibility tree, not screenshots: `cdp("Accessibility.getFullAXTree")["nodes"]` has every element's role, name, and `backendDOMNodeId` — filter in Python before printing (it is thousands of nodes). Coordinates: `q = cdp("DOM.getBoxModel", backendNodeId=n)["model"]["content"]; x, y = sum(q[0::2])/4, sum(q[1::2])/4` (viewport px, ready for `click_at_xy`; negative/oversized means scroll first).
 - Clicking: AX node -> box center -> `click_at_xy(x, y)` -> verify with a targeted `js(...)`/`page_info()` check.
 - Fall back to raw HTML via `js(...)` only when the AX tree lacks the element (canvas, exotic widgets); screenshot when layout or imagery matters.
