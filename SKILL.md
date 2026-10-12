@@ -64,6 +64,11 @@ PY
 - Fall back to raw HTML via `js(...)` only when the AX tree lacks the element (canvas, exotic widgets); screenshot when layout or imagery matters.
 - After navigation, call `wait_for_load()`.
 - If the current tab is stale or internal, call `ensure_real_tab()`.
+- If the default daemon becomes stale, use its built-in reattachment/recovery
+  first. A command timeout, truncated output, site change, closed tab, or new task
+  is not a reason to create another daemon. Run `browser-harness --doctor` and
+  restart or replace the default daemon only when it is actually dead or cannot
+  recover.
 - Use `js(...)` for DOM inspection or extraction when coordinates are the wrong tool.
 - When entering unusually long text, avoid slow per-character typing: find a faster page-appropriate input method, then verify the page kept the exact value.
 - Login walls: stop and ask. Exception: use available SSO automatically when Chrome is already signed in; still stop for passwords, MFA, consent, or ambiguous account choice.
