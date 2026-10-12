@@ -278,6 +278,15 @@ def test_wait_for_element_visible_uses_check_visibility():
     assert not any("offsetParent" in e for e in js_exprs)
 
 
+def test_visible_text_skips_transparent_and_hidden_text():
+    with patch("browser_harness.helpers.js", return_value="Saved") as js:
+        assert helpers.visible_text() == "Saved"
+
+    expression = js.call_args.args[0]
+    assert "checkOpacity:true" in expression and "checkVisibilityCSS:true" in expression
+    assert "innerText" not in expression
+
+
 def test_wait_for_element_non_visible_uses_simple_check():
     js_exprs = []
 

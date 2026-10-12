@@ -591,6 +591,19 @@ def _js_evaluate(expression, sid):
         raise
 
 
+def visible_text():
+    """Page text a person can see, one line per text node.
+
+    innerText also returns text at opacity 0, which pages use for banners that are not
+    shown yet, so a check against it can pass when nothing happened."""
+    return js(
+        "(()=>{const out=[],walk=document.createTreeWalker(document.body||document.documentElement,NodeFilter.SHOW_TEXT);"
+        "for(let n;n=walk.nextNode();){const t=n.textContent.trim();"
+        "if(t&&n.parentElement.checkVisibility({checkOpacity:true,checkVisibilityCSS:true}))out.push(t)}"
+        "return out.join('\\n')})()"
+    )
+
+
 def _detach_iframe_session(sid):
     """Release the session js(target_id=...) attached so polling loops do not
     accumulate one live session (and one event stream) per call. A session that
