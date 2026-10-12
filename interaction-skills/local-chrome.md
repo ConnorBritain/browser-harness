@@ -20,12 +20,6 @@ required, remote auth is unavailable or unsuitable, and the extra Chrome
 approval prompt is acceptable. It creates another controller and dedicated tab
 in the same local Chrome profile, not another Chrome profile or process.
 
-If the default daemon becomes stale, use its built-in reattachment/recovery
-first. A command timeout, truncated output, site change, closed tab, or new task
-is not a reason to create another daemon. Run `browser-harness --doctor` and
-restart or replace the default daemon only when it is actually dead or cannot
-recover.
-
 If the daemon cannot connect, run diagnostics:
 
 ```bash
