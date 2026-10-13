@@ -455,18 +455,24 @@ class Daemon:
         tabs = ", ".join(f"{t} {self.info.get(t, {}).get('url', '')}".strip() for t in o.tabs)
         return f"Your tabs: {tabs or 'none'}."
 
+    def _holder(self, tid):
+        """Who holds the tab now. A tab whose owner has been idle for OWNER_IDLE is free to take."""
+        key = self.tab_owner.get(tid)
+        return key if key and time.time() - self.owners[key].seen <= OWNER_IDLE else None
+
     def _taken(self, o, tid):
         return {"error": f"tab-taken: tab {tid} is driven by another agent. Nothing was sent. {self._yours(o)}"}
 
-    def _closed(self, o, tid):
+    def _closed(self, o, tid, taken=False):
         url = self.info.get(tid, {}).get("url", "")
-        return f"tab-closed: your tab {tid} {url} was closed. Nothing was sent. {self._yours(o)} Call new_tab(url) or switch_tab(tab)."
+        kind, what = ("tab-released", "was taken by another agent while you were idle") if taken else ("tab-closed", "was closed")
+        return f"{kind}: your tab {tid}{' ' + url if url else ''} {what}. Nothing was sent. {self._yours(o)} Call new_tab(url) or switch_tab(tab)."
 
     def _mine(self, key, o, tid):
         """None when the owner holds tid, else the error to return."""
         if self.tab_owner.get(tid) == key:
             return None
-        return self._taken(o, tid) if tid in self.tab_owner else {"error": f"tab {tid} is not yours; switch_tab() to it first"}
+        return self._taken(o, tid) if self._holder(tid) else {"error": f"tab {tid} is not yours; switch_tab() to it first"}
 
     def _own(self, key, tid, current=True, created=False):
         o = self.owners[key]
@@ -478,7 +484,7 @@ class Daemon:
             o.current = tid
         self._save()
 
-    def _drop(self, tid):
+    def _drop(self, tid, taken=False):
         """Forget a tab. If it was the owner's current tab, its next command learns it once."""
         key = self.tab_owner.pop(tid, None)
         if key is None:
@@ -488,7 +494,7 @@ class Daemon:
         o.marks.pop(tid, None)
         o.created.discard(tid)
         if o.current == tid:
-            o.current, o.gone = None, self._closed(o, tid)
+            o.current, o.gone = None, self._closed(o, tid, taken)
         self._save()
 
     def _save(self):
@@ -561,26 +567,20 @@ class Daemon:
         )))
 
     async def _release(self, key, o):
-        """The owner went idle. Its current tab and its marked tabs are left alone. Its other
-        tabs are given back: detached, title cleaned, left open. Only with BH_CLOSE_IDLE_TABS=1
+        """The owner went idle. Its current tab is left alone. Its other tabs are given back:
+        detached and left open, unmarked ones with a clean title. Only with BH_CLOSE_IDLE_TABS=1
         are the unmarked tabs it opened closed instead (never the browser's last real page)."""
         close = os.environ.get("BH_CLOSE_IDLE_TABS") == "1"
         for tid, sid in list(o.tabs.items()):
             if tid == o.current:
                 continue
-            if tid in o.marks:
-                if sid:
-                    o.tabs[tid] = None
-                    self.session_owner.pop(sid, None)
-                    await _silent(self.cdp.send_raw("Target.detachFromTarget", {"sessionId": sid}))
-                continue
             last = sum(i.get("type") == "page" and is_real_page(i) for i in self.info.values()) <= 1
-            if close and tid in o.created and not last:
+            if close and tid in o.created and tid not in o.marks and not last:
                 await _silent(self.cdp.send_raw("Target.closeTarget", {"targetId": tid}))
                 self.info.pop(tid, None)
             elif sid:
-                if task := self._mark(key, tid, prefix=""):
-                    await task
+                if tid not in o.marks and (task := self._mark(key, tid, prefix="")):
+                    await task  # a marked tab keeps its title for the person
                 await _silent(self.cdp.send_raw("Target.detachFromTarget", {"sessionId": sid}))
             self._drop(tid)
 
@@ -754,7 +754,7 @@ class Daemon:
             return {"dialog": o.dialog}
         if meta == "tabs":
             pages = [t for t in (await self.cdp.send_raw("Target.getTargets"))["targetInfos"] if t["type"] == "page"]
-            return {"tabs": [{**t, "owner": {key: "you", None: None}.get(self.tab_owner.get(t["targetId"]), "taken"),
+            return {"tabs": [{**t, "owner": "you" if self.tab_owner.get(t["targetId"]) == key else "taken" if self._holder(t["targetId"]) else None,
                               "mark": o.marks.get(t["targetId"])} for t in pages]}
         if meta == "name_session":
             o.name = re.sub(r"\s+", "-", str(req.get("name") or "").strip())[:16] or None
@@ -796,11 +796,13 @@ class Daemon:
                 info = (await self.cdp.send_raw("Target.getTargetInfo", {"targetId": tid}))["targetInfo"]
             except Exception:
                 return {"error": f"tab-closed: tab {tid} does not exist. Nothing was sent. {self._yours(o)} Call list_tabs()."}
-            if self.tab_owner.get(tid, key) != key:
+            if self._holder(tid) not in (None, key):
                 return self._taken(o, tid)
             if req.get("url") and info.get("url") != req["url"]:
                 return {"error": f"tab-changed: tab {tid} now shows {info.get('url')}, not {req['url']}. Nothing was sent. Call list_tabs() and pick again."}
             o.gone = None
+            if self.tab_owner.get(tid, key) != key:
+                self._drop(tid, taken=True)  # its owner went idle; it learns this on its next command
             self._own(key, tid, current=False)
             sid = await self._session(key, o, tid)  # the current tab moves only once the new one is attached
             o.current = tid
@@ -829,7 +831,7 @@ class Daemon:
     async def _send(self, key, o, req):
         method, params, sid = req["method"], req.get("params") or {}, req.get("session_id")
         if method.startswith("Target."):  # browser-level; never routed through a tab session
-            if method in GUARDED and self.tab_owner.get(params.get("targetId"), key) != key:
+            if method in GUARDED and self._holder(params.get("targetId")) not in (None, key):
                 return self._taken(o, params.get("targetId"))
             result = await self.cdp.send_raw(method, params)
             if method == "Target.attachToTarget":
