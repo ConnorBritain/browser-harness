@@ -387,6 +387,11 @@ def list_tabs(include_chrome=True):
         out.append(tab)
     return out
 
+def release_tabs():
+    """Call when your task is done: closes the unmarked tabs you opened, gives back the
+    tabs you took from the person, and leaves marked tabs open for them."""
+    _send({"meta": "release_tabs"})
+
 def list_browsers():
     """Running browsers, one per daemon name: [{name, kind, endpoint, current}]."""
     from .admin import _daemon_endpoint_names, _ping

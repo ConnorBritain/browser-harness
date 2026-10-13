@@ -540,10 +540,11 @@ def test_mark_tab_and_name_session_are_daemon_commands(monkeypatch):
     helpers.mark_tab({"targetId": "t1"}, "deliverable")
     helpers.mark_tab(None, None)
     helpers.name_session("shop")
+    helpers.release_tabs()
 
     assert sent == [{"meta": "mark_tab", "target_id": "t1", "mark": "deliverable"},
                     {"meta": "mark_tab", "target_id": None, "mark": None},
-                    {"meta": "name_session", "name": "shop"}]
+                    {"meta": "name_session", "name": "shop"}, {"meta": "release_tabs"}]
 
 
 def test_send_carries_the_owner(monkeypatch):

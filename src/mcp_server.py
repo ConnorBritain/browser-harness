@@ -43,6 +43,7 @@ from browser_harness.helpers import (
     new_tab,
     page_info,
     press_key,
+    release_tabs,
     scroll,
     start_recording,
     stop_recording,
@@ -238,6 +239,13 @@ def browser_mark_tab(mark: str | None, target: str | None = None):
     """Mark one of your tabs (default: the current one). "deliverable": it stays open for
     the person when you are done. "handoff": the person should act in it now. null clears."""
     return {"mark": mark_tab(target, mark)}
+
+
+@_tool
+def browser_release_tabs():
+    """Call when done: closes the unmarked tabs you opened, gives back tabs you took, keeps marked tabs open."""
+    release_tabs()
+    return {"ok": True}
 
 
 @_tool

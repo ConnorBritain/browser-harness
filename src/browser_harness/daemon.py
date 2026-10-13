@@ -595,13 +595,14 @@ class Daemon:
             timeout=2,
         )))
 
-    async def _release(self, key, o):
-        """The owner went idle. Its current tab is left alone. Its other tabs are given back:
-        detached and left open, unmarked ones with a clean title. Only with BH_CLOSE_IDLE_TABS=1
-        are the unmarked tabs it opened closed instead (never the browser's last real page)."""
-        close = os.environ.get("BH_CLOSE_IDLE_TABS") == "1"
+    async def _release(self, key, o, done=False):
+        """The owner went idle: its current tab is left alone, its other tabs are given back,
+        detached and left open, unmarked ones with a clean title. An owner that says it is
+        done (release_tabs), or BH_CLOSE_IDLE_TABS=1, also closes the unmarked tabs it opened
+        itself, never the browser's last real page. Done gives back the current tab too."""
+        close = done or os.environ.get("BH_CLOSE_IDLE_TABS") == "1"
         for tid, sid in list(o.tabs.items()):
-            if tid == o.current:
+            if tid == o.current and not done:
                 continue
             last = sum(i.get("type") == "page" and is_real_page(i) for i in self.info.values()) <= 1
             if close and tid in o.created and tid not in o.marks and not last:
@@ -612,6 +613,8 @@ class Daemon:
                     await task  # a marked tab keeps its title for the person
                 await _silent(self.cdp.send_raw("Target.detachFromTarget", {"sessionId": sid}))
             self._drop(tid)
+        if done:
+            o.gone = None  # it gave its current tab back itself
 
     async def sweep(self):
         """Release owners idle longer than OWNER_IDLE; forget idle owners with no tabs.
@@ -791,6 +794,10 @@ class Daemon:
             pages = [t for t in (await self.cdp.send_raw("Target.getTargets"))["targetInfos"] if t["type"] == "page"]
             return {"tabs": [{**self._visible(key, t), "owner": "you" if self.tab_owner.get(t["targetId"]) == key else "taken" if self._holder(t["targetId"]) else None,
                               "mark": o.marks.get(t["targetId"])} for t in pages]}
+        if meta == "release_tabs":
+            async with o.lock:
+                await self._release(key, o, done=True)
+            return {"released": True}
         if meta == "name_session":
             o.name = re.sub(r"\s+", "-", str(req.get("name") or "").strip())[:16] or None
             for tid in o.tabs:
