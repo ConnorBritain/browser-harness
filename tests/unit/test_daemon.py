@@ -1,7 +1,9 @@
 import asyncio
+import base64
 import json
 import os
-import socket
+import shutil
+import tempfile
 import time
 
 import pytest
@@ -934,6 +936,41 @@ def test_daemon_exits_when_the_browser_connection_closes(monkeypatch):
         d.cdp._message_handler_task = asyncio.create_task(asyncio.sleep(0.01))  # the websocket reader ends
         await asyncio.wait_for(daemon.serve(d), timeout=2)
     asyncio.run(go())
+
+
+def test_a_5_mb_upload_fits_in_one_request(monkeypatch):
+    """Review B3: the fallback for cloud uploads sends the file inside one IPC line."""
+    if daemon.ipc.IS_WINDOWS:
+        pytest.skip("unix socket path")
+    runtime = tempfile.mkdtemp(prefix="bh", dir="/tmp")  # AF_UNIX paths must stay short
+    monkeypatch.setattr(daemon.ipc, "_RUNTIME", daemon.ipc.Path(runtime))
+    monkeypatch.setattr(daemon, "NAME", "t")
+    monkeypatch.setattr(daemon, "log", lambda _m: None)
+    payload = base64.b64encode(os.urandom(5 << 20)).decode()
+
+    def upload():
+        c, token = daemon.ipc.connect("t", timeout=5)
+        try:
+            return daemon.ipc.request(c, token, {**cmd("a", "Runtime.callFunctionOn", arguments=[{"value": [["f.pdf", payload, "application/pdf"]]}])})
+        finally:
+            c.close()
+
+    async def go():
+        d = _daemon()
+        d.stop = asyncio.Event()
+        serving = asyncio.create_task(daemon.serve(d))
+        await asyncio.sleep(0.2)
+        reply = await asyncio.to_thread(upload)
+        d.stop.set()
+        await serving
+        return d, reply
+    try:
+        d, reply = asyncio.run(go())
+    finally:
+        shutil.rmtree(runtime)
+
+    assert reply == {"result": {}}
+    assert [p["arguments"][0]["value"][0][1] == payload for m, p, _s in d.cdp.calls if m == "Runtime.callFunctionOn"] == [True]
 
 
 # --- owner state survives a daemon restart ---
