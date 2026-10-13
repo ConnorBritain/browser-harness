@@ -375,16 +375,30 @@ def _is_agent_startup_placeholder(title, url):
 
 
 def list_tabs(include_chrome=True):
-    """Every tab with its owner: "you", None (the person's, free to switch_tab) or
-    "taken" (another agent's, shown without title or url)."""
+    """Every tab with its owner: "you" (with your mark), None (the person's, free
+    to switch_tab) or "taken" (another agent's, shown without title or url)."""
     out = []
     for t in _send({"meta": "tabs"})["tabs"]:
         url = t.get("url", "")
         if _is_agent_startup_placeholder(t.get("title", ""), url): continue
         if not include_chrome and url.startswith(INTERNAL): continue
         tab = {"targetId": t["targetId"], "target_id": t["targetId"], "owner": t["owner"]}
-        out.append(tab if t["owner"] == "taken" else {**tab, "title": t.get("title", ""), "url": url})
+        if t["owner"] != "taken":
+            tab.update(title=t.get("title", ""), url=url)
+        if t.get("mark"):
+            tab["mark"] = t["mark"]
+        out.append(tab)
     return out
+
+def name_session(name):
+    """Name your session. Your tabs' titles show it, so the person sees which agent holds which tab."""
+    return _send({"meta": "name_session", "name": name})["name"]
+
+def mark_tab(tab, mark):
+    """mark="deliverable": the tab stays open for the person when you are done.
+    mark="handoff": the person should act in it now. None clears the mark.
+    Unmarked tabs are released when you go idle; unmarked tabs you opened are closed."""
+    return _send({"meta": "mark_tab", "target_id": _target_id(tab), "mark": mark})["mark"]
 
 def current_tab():
     """Your current tab. A fresh owner gets its own background tab, never the person's."""

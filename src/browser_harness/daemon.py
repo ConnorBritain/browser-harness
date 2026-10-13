@@ -1,5 +1,5 @@
 """CDP WS holder + IPC relay (Unix socket on POSIX, TCP loopback on Windows). One daemon per BU_NAME."""
-import asyncio, json, os, platform, socket, sys, time, urllib.error, urllib.request
+import asyncio, json, os, platform, re, socket, sys, time, urllib.error, urllib.request
 from urllib.parse import urlparse
 from collections import deque
 from dataclasses import dataclass, field
@@ -127,12 +127,19 @@ LOCAL_HANDSHAKE_TIMEOUT = None
 # How long get_ws_url() keeps waiting for DevToolsActivePort before giving up
 NO_TOGGLE_GRACE = 3
 TOGGLE_BOOT_GRACE = 12
-TAB_MARKER_JS ="if(!document.title.startsWith('\U0001F434'))document.title='\U0001F434 '+document.title"
+OWNER_IDLE = float(os.environ.get("BH_OWNER_IDLE", 1800))  # seconds before an idle owner's tabs are released
+SWEEP_EVERY = min(60, OWNER_IDLE)
+MARKS = {"deliverable": "\U0001F4CC", "handoff": "✋"}  # pin: stays for the person; raised hand: person acts now
 
 
 def tab_marker_enabled():
     """Whether the cosmetic controlled-tab title marker should be added."""
     return os.environ.get("BH_TAB_MARKER", "").strip().lower() not in {"0", "false", "no", "off"}
+
+
+def tab_marker_js(prefix):
+    """Replace any earlier marker ("\U0001F434<label><mark> ") at the start of the title with `prefix`."""
+    return f"(p=>{{const t=document.title.replace(/^\\u{{1F434}}\\S* /u,'');if(document.title!==p+t)document.title=p+t}})({json.dumps(prefix)})"
 
 
 def _devtools_port_live(base):
@@ -421,6 +428,9 @@ class Owner:
     gone: str | None = None  # typed error returned once on the owner's next command
     seen: float = field(default_factory=time.time)
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    name: str | None = None  # from name_session(), shown in the owner's tab titles
+    marks: dict = field(default_factory=dict)  # target_id -> "deliverable" | "handoff"
+    created: set = field(default_factory=set)  # tabs this owner opened; unmarked ones close when it goes idle
 
 
 class Daemon:
@@ -450,42 +460,56 @@ class Daemon:
         url = self.info.get(tid, {}).get("url", "")
         return f"tab-closed: your tab {tid} {url} was closed. Nothing was sent. {self._yours(o)} Call new_tab(url) or switch_tab(tab)."
 
-    def _own(self, key, tid, current=True):
+    def _mine(self, key, o, tid):
+        """None when the owner holds tid, else the error to return."""
+        if self.tab_owner.get(tid) == key:
+            return None
+        return self._taken(o, tid) if tid in self.tab_owner else {"error": f"tab {tid} is not yours; switch_tab() to it first"}
+
+    def _own(self, key, tid, current=True, created=False):
         o = self.owners[key]
         self.tab_owner[tid] = key
         o.tabs.setdefault(tid, None)
+        if created:
+            o.created.add(tid)
         if current:
             o.current = tid
         self._save()
 
     def _drop(self, tid):
-        """Forget a closed tab. Its owner's next command learns it once."""
+        """Forget a tab. If it was the owner's current tab, its next command learns it once."""
         key = self.tab_owner.pop(tid, None)
         if key is None:
             return
         o = self.owners[key]
         self.session_owner.pop(o.tabs.pop(tid, None), None)
+        o.marks.pop(tid, None)
+        o.created.discard(tid)
         if o.current == tid:
             o.current, o.gone = None, self._closed(o, tid)
         self._save()
 
     def _save(self):
-        state = {k: {"tabs": list(o.tabs), "current": o.current} for k, o in self.owners.items() if o.tabs}
+        state = {k: {"tabs": list(o.tabs), "current": o.current, "name": o.name, "marks": o.marks,
+                     "created": sorted(o.created)} for k, o in self.owners.items() if o.tabs}
         tmp = STATE.with_name(f"{STATE.name}.tmp")
         tmp.write_text(json.dumps(state))
         os.replace(tmp, STATE)
 
     def _load(self, pages):
-        """Owners keep their tabs across daemon restarts."""
+        """Owners keep their tabs, names and marks across daemon restarts."""
         try:
             state = json.loads(STATE.read_text())
         except (OSError, ValueError):
             return
         for key, saved in state.items():
-            self.owner(key)
+            o = self.owner(key)
+            o.name = saved.get("name")
             for tid in saved.get("tabs", []):
                 if tid in pages:
-                    self._own(key, tid, current=tid == saved.get("current"))
+                    self._own(key, tid, current=tid == saved.get("current"), created=tid in saved.get("created", []))
+                    if mark := saved.get("marks", {}).get(tid):
+                        o.marks[tid] = mark
 
     async def _current(self, key, o):
         """The owner's current tab. A fresh owner gets its own background tab, never the person's."""
@@ -495,7 +519,7 @@ class Daemon:
                          and i.get("type") == "page" and is_blank(i.get("url", ""))]
                 tid = spare[0] if spare else (await self.cdp.send_raw(
                     "Target.createTarget", {"url": "about:blank", "background": True}))["targetId"]
-                self._own(key, tid)
+                self._own(key, tid, created=not spare)
             return o.current
 
     async def _session(self, key, o, tid):
@@ -505,8 +529,53 @@ class Daemon:
                 sid = (await self.cdp.send_raw("Target.attachToTarget", {"targetId": tid, "flatten": True}))["sessionId"]
                 o.tabs[tid], self.session_owner[sid] = sid, key
                 await self._enable_default_domains(sid)
-                self._schedule_tab_marker(sid)
+                self._mark(key, tid)
             return o.tabs.get(tid)
+
+    def _mark(self, key, tid, prefix=None):
+        """Show in the tab title which agent holds it and its mark, off the synchronous IPC path."""
+        o = self.owners[key]
+        if not tab_marker_enabled() or not o.tabs.get(tid):
+            return None
+        if prefix is None:
+            label = o.name or ("" if key == "default" else re.sub(r"\W", "", key)[:6])
+            prefix = f"\U0001F434{label}{MARKS.get(o.marks.get(tid), '')} "
+        return asyncio.create_task(_silent(asyncio.wait_for(
+            self.cdp.send_raw("Runtime.evaluate", {"expression": tab_marker_js(prefix)}, session_id=o.tabs[tid]),
+            timeout=2,
+        )))
+
+    async def _release(self, key, o):
+        """The owner went idle. Marked tabs stay open and owned for the person; unmarked tabs it
+        opened close (never the browser's last tab); unmarked tabs it took are given back."""
+        for tid, sid in list(o.tabs.items()):
+            if tid in o.marks:
+                if sid:
+                    o.tabs[tid] = None
+                    self.session_owner.pop(sid, None)
+                    await _silent(self.cdp.send_raw("Target.detachFromTarget", {"sessionId": sid}))
+                continue
+            last = sum(i.get("type") == "page" for i in self.info.values()) <= 1
+            if tid in o.created and not last:
+                await _silent(self.cdp.send_raw("Target.closeTarget", {"targetId": tid}))
+                self.info.pop(tid, None)
+            elif sid:
+                if task := self._mark(key, tid, prefix=""):
+                    await task
+                await _silent(self.cdp.send_raw("Target.detachFromTarget", {"sessionId": sid}))
+            self._drop(tid)
+        o.current = o.gone = None
+        self._save()
+
+    async def sweep(self):
+        """Release owners idle longer than OWNER_IDLE; forget idle owners with no tabs."""
+        for key, o in list(self.owners.items()):
+            if time.time() - o.seen <= OWNER_IDLE:
+                continue
+            if any(o.tabs.values()) or o.tabs.keys() - o.marks.keys():
+                await self._release(key, o)
+            elif not o.tabs:
+                del self.owners[key]
 
     async def _close_inspect_tabs(self, targets):
         """Close chrome://inspect tabs left open by the permission recovery flow"""
@@ -536,15 +605,6 @@ class Daemon:
                 log(f"enable {d} on {session_id}: {e}")
         await asyncio.gather(*(enable_one(d) for d in ("Page", "DOM", "Runtime", "Network")))
 
-    def _schedule_tab_marker(self, session_id):
-        """Mark the controlled tab without extending the synchronous IPC path."""
-        if not tab_marker_enabled():
-            return None
-        return asyncio.create_task(_silent(asyncio.wait_for(
-            self.cdp.send_raw("Runtime.evaluate", {"expression": TAB_MARKER_JS}, session_id=session_id),
-            timeout=2,
-        )))
-
     def _record_event(self, method, params, session_id=None):
         key = self.session_owner.get(session_id)
         if method == "Target.attachedToTarget" and key:
@@ -563,7 +623,9 @@ class Daemon:
         elif method == "Page.javascriptDialogClosed":
             o.dialog = None
         elif method in ("Page.loadEventFired", "Page.domContentEventFired"):
-            self._schedule_tab_marker(session_id)
+            for tid, sid in o.tabs.items():
+                if sid == session_id:
+                    self._mark(key, tid)
 
     def _target_event(self, method, p):
         info = p.get("targetInfo") or {}
@@ -572,7 +634,7 @@ class Daemon:
             self.info[tid] = info
             opener = self.tab_owner.get(info.get("openerId"))
             if method == "Target.targetCreated" and opener and info.get("type") == "page":
-                self._own(opener, tid, current=False)  # a popup belongs to its opener's owner
+                self._own(opener, tid, current=False, created=True)  # a popup belongs to its opener's owner
         elif method == "Target.targetDestroyed":
             self._drop(tid)
             self.info.pop(tid, None)
@@ -658,7 +720,27 @@ class Daemon:
             return {"dialog": o.dialog}
         if meta == "tabs":
             pages = [t for t in (await self.cdp.send_raw("Target.getTargets"))["targetInfos"] if t["type"] == "page"]
-            return {"tabs": [{**t, "owner": {key: "you", None: None}.get(self.tab_owner.get(t["targetId"]), "taken")} for t in pages]}
+            return {"tabs": [{**t, "owner": {key: "you", None: None}.get(self.tab_owner.get(t["targetId"]), "taken"),
+                              "mark": o.marks.get(t["targetId"])} for t in pages]}
+        if meta == "name_session":
+            o.name = re.sub(r"\s+", "-", str(req.get("name") or "").strip())[:16] or None
+            for tid in o.tabs:
+                self._mark(key, tid)
+            self._save()
+            return {"name": o.name}
+        if meta == "mark_tab":
+            tid, mark = req.get("target_id") or o.current, req.get("mark")
+            if mark not in (None, *MARKS):
+                return {"error": f"mark_tab: mark must be one of {sorted(MARKS)} or None, not {mark!r}"}
+            if err := self._mine(key, o, tid):
+                return err
+            if mark:
+                o.marks[tid] = mark
+            else:
+                o.marks.pop(tid, None)
+            self._mark(key, tid)
+            self._save()
+            return {"target_id": tid, "mark": mark}
         if meta == "connection_status":
             await self.cdp.send_raw("Browser.getVersion")  # raises when the browser connection is dead
             page = None
@@ -669,8 +751,8 @@ class Daemon:
             return {"target_id": o.current, "session_id": o.tabs.get(o.current), "page": page}
         if meta == "close_tab":
             tid = req.get("target_id") or o.current
-            if self.tab_owner.get(tid) != key:
-                return self._taken(o, tid) if tid in self.tab_owner else {"error": f"close_tab: tab {tid} is not yours; switch_tab() to it first"}
+            if err := self._mine(key, o, tid):
+                return err
             await self.cdp.send_raw("Target.closeTarget", {"targetId": tid})
             self._drop(tid)
             return {"closed": tid}
@@ -692,9 +774,9 @@ class Daemon:
         if meta == "new_tab":
             o.gone = None
             reuse = req.get("reuse") and o.current and is_blank(self.info.get(o.current, {}).get("url", "-"))
-            tid = o.current if reuse else None
-            tid = tid or (await self.cdp.send_raw("Target.createTarget", {"url": "about:blank", "background": True}))["targetId"]
-            self._own(key, tid)
+            tid = o.current if reuse else (await self.cdp.send_raw(
+                "Target.createTarget", {"url": "about:blank", "background": True}))["targetId"]
+            self._own(key, tid, created=not reuse)
             return {"target_id": tid, "session_id": await self._session(key, o, tid)}
         if o.gone:
             gone, o.gone = o.gone, None
@@ -764,7 +846,12 @@ async def serve(d):
         finally:
             writer.close()
 
-    tasks = {asyncio.create_task(ipc.serve(NAME, handler)), asyncio.create_task(d.stop.wait())}
+    async def sweeper():
+        while True:
+            await asyncio.sleep(SWEEP_EVERY)
+            await _silent(d.sweep())
+
+    tasks = {asyncio.create_task(ipc.serve(NAME, handler)), asyncio.create_task(d.stop.wait()), asyncio.create_task(sweeper())}
     if reader := getattr(d.cdp, "_message_handler_task", None):
         tasks.add(reader)  # the browser connection closed: exit instead of serving a dead browser
     await asyncio.sleep(0.05)  # let serve() bind so sock_addr() resolves to the live endpoint
