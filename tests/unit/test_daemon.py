@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 
 import pytest
@@ -75,811 +76,543 @@ def test_shutdown_keeps_daemon_alive_when_cloud_stop_fails(monkeypatch):
     assert d.stop.is_set() is False
 
 
-class _FakeCDP:
-    """Records send_raw calls so tests can assert which CDP methods fired."""
+class _Browser:
+    """A fake browser: pages by target id, sessions, and every CDP call it received."""
 
-    def __init__(self):
-        self.calls = []  # list of (method, params, session_id)
+    def __init__(self, *pages):
+        self.calls = []  # (method, params, session_id)
+        self.pages = dict(pages)  # target_id -> url
+        self.stale = set()  # sessions Chrome no longer knows
+        self.fail = {}  # method -> exception raised once
+        self.n = 0
+
+    def info(self, tid):
+        return {"targetId": tid, "type": "page", "url": self.pages[tid], "title": tid}
 
     async def send_raw(self, method, params=None, session_id=None):
+        params = params or {}
         self.calls.append((method, params, session_id))
-        # Set-session/initial-attach paths only need a benign response.
+        if session_id in self.stale:
+            raise RuntimeError("{'code': -32001, 'message': 'Session with given id not found'}")
+        if method in self.fail:
+            raise self.fail.pop(method)
+        tid = params.get("targetId")
+        if method in ("Target.getTargetInfo", "Target.attachToTarget") and tid not in self.pages:
+            raise RuntimeError("No target with given id found")
+        if method == "Target.getTargets":
+            return {"targetInfos": [self.info(t) for t in self.pages]}
+        if method == "Target.getTargetInfo":
+            return {"targetInfo": self.info(tid)}
+        if method == "Target.createTarget":
+            self.n += 1
+            self.pages[f"tab-{self.n}"] = params["url"]
+            return {"targetId": f"tab-{self.n}"}
+        if method == "Target.attachToTarget":
+            self.n += 1
+            return {"sessionId": f"s{self.n}-{tid}"}
+        if method == "Target.closeTarget":
+            self.pages.pop(tid, None)
         return {}
 
+    def sent(self, method):
+        return [s for m, _p, s in self.calls if m == method]
 
-def _fresh_daemon():
+    def tab_of(self, session):
+        return session.split("-", 1)[1]
+
+
+def _daemon(*pages):
     d = daemon.Daemon()
-    d.cdp = _FakeCDP()
+    d.cdp = _Browser(*pages)
+    d.info = {t: d.cdp.info(t) for t in d.cdp.pages}
     return d
 
 
-@pytest.mark.parametrize("value", ["0", "false", "NO", "off"])
-def test_tab_marker_can_be_disabled_before_set_session_schedules_it(monkeypatch, value):
-    monkeypatch.setenv("BH_TAB_MARKER", value)
-    d = _fresh_daemon()
-
-    async def run():
-        await d.handle({
-            "meta": "set_session",
-            "session_id": "session-without-marker",
-            "target_id": "target-without-marker",
-        })
-        await asyncio.sleep(0)
-
-    asyncio.run(run())
-
-    assert not [call for call in d.cdp.calls if call[0] == "Runtime.evaluate"]
+def _run(d, *reqs):
+    async def go():
+        return [await d.handle(r) for r in reqs]
+    return asyncio.run(go())
 
 
-def test_tab_marker_stays_enabled_by_default(monkeypatch):
-    monkeypatch.delenv("BH_TAB_MARKER", raising=False)
-    d = _fresh_daemon()
-
-    async def run():
-        await d.handle({
-            "meta": "set_session",
-            "session_id": "session-with-marker",
-            "target_id": "target-with-marker",
-        })
-        await asyncio.sleep(0)
-
-    asyncio.run(run())
-
-    assert [call for call in d.cdp.calls if call[0] == "Runtime.evaluate"] == [
-        (
-            "Runtime.evaluate",
-            {"expression": daemon.TAB_MARKER_JS},
-            "session-with-marker",
-        )
-    ]
+def cmd(owner, method="Input.insertText", **params):
+    return {"owner": owner, "method": method, "params": params or {"text": "x"}}
 
 
-@pytest.mark.parametrize("value", ["0", "false", "NO", "off"])
-def test_tab_marker_disabled_on_page_load_events(monkeypatch, value):
-    monkeypatch.setenv("BH_TAB_MARKER", value)
-    d = _fresh_daemon()
-    d.session = "loaded-session"
-
-    d._record_event("Page.loadEventFired", {}, "loaded-session")
-
-    assert not [call for call in d.cdp.calls if call[0] == "Runtime.evaluate"]
+def meta(owner, name, **fields):
+    return {"owner": owner, "meta": name, **fields}
 
 
-def test_set_session_enables_all_four_default_domains_on_new_session():
-    """Regression: switch_tab() / new_tab() in helpers.py route through the
-    `set_session` IPC, which previously only enabled Page on the new
-    session. With Network disabled, wait_for_network_idle() silently stops
-    receiving events after a tab switch. Initial attach enables all four
-    (Page, DOM, Runtime, Network); set_session must enable the same set."""
-    d = _fresh_daemon()
-    new_session = "session-AFTER-switch"
-
-    asyncio.run(d.handle({
-        "meta": "set_session",
-        "session_id": new_session,
-        "target_id": "target-2",
-    }))
-
-    enabled_on_new = [
-        method for (method, _params, sid) in d.cdp.calls
-        if sid == new_session and method.endswith(".enable")
-    ]
-    assert set(enabled_on_new) == {"Page.enable", "DOM.enable", "Runtime.enable", "Network.enable"}, (
-        f"set_session must enable Page/DOM/Runtime/Network on the new session "
-        f"(parity with initial attach). Got: {enabled_on_new}"
-    )
-    assert d.session == new_session
-    assert d.target_id == "target-2"
+PERSON = ("person-tab", "https://mail.example/")
 
 
-def test_set_session_falls_back_to_existing_target_id_when_not_provided():
-    """If a caller forgets target_id (passes None), the daemon should keep its
-    existing target_id rather than overwriting it with None — otherwise
-    subsequent calls that depend on self.target_id would break."""
-    d = _fresh_daemon()
-    d.target_id = "original-target"
+# --- owners and their tabs ---
 
-    asyncio.run(d.handle({
-        "meta": "set_session",
-        "session_id": "session-AFTER",
-        "target_id": None,
-    }))
+def test_fresh_owner_gets_its_own_background_tab_never_the_persons():
+    """Flipped on purpose: the default daemon used to drive the person's first tab."""
+    d = _daemon(PERSON)
 
-    assert d.target_id == "original-target"
-    assert d.session == "session-AFTER"
+    [r] = _run(d, cmd("a"))
+
+    assert r == {"result": {}}
+    assert [p for m, p, _s in d.cdp.calls if m == "Target.createTarget"] == [{"url": "about:blank", "background": True}]
+    assert [d.cdp.tab_of(s) for s in d.cdp.sent("Input.insertText")] == ["tab-1"]
+    assert d.tab_owner == {"tab-1": "a"}
 
 
-def test_enable_default_domains_swallows_errors_per_domain():
-    """A single domain failing to enable must not prevent the others from
-    being attempted — that would leave the daemon in a partially-configured
-    state. Each Domain.enable call has its own try/except inside the helper."""
-    class _PartialFailureCDP(_FakeCDP):
-        async def send_raw(self, method, params=None, session_id=None):
-            self.calls.append((method, params, session_id))
-            if method == "DOM.enable":
-                raise RuntimeError("simulated DOM failure")
-            return {}
+def test_old_clients_without_owner_share_the_default_owner():
+    d = _daemon()
 
-    d = daemon.Daemon()
-    d.cdp = _PartialFailureCDP()
+    _run(d, {"method": "Input.insertText", "params": {"text": "x"}}, cmd("default"))
 
-    asyncio.run(d._enable_default_domains("session-X"))
-
-    attempted = [m for (m, _p, _s) in d.cdp.calls]
-    assert "Page.enable" in attempted
-    assert "DOM.enable" in attempted  # attempted, but raised
-    assert "Runtime.enable" in attempted
-    assert "Network.enable" in attempted
+    assert len(d.cdp.sent("Target.createTarget")) == 1
+    assert d.tab_owner == {"tab-1": "default"}
 
 
-def test_set_session_disables_network_on_old_session_before_enabling_new():
-    """When switching tabs, the previous session's Network domain must be
-    disabled so background tabs (polling, SSE, etc.) stop emitting events
-    into the global buffer that wait_for_network_idle reads. Initial attach
-    has no `old_session` so this disable doesn't fire then."""
-    d = _fresh_daemon()
-    d.session = "session-OLD"
-    d.target_id = "target-OLD"
+def test_each_owner_drives_only_its_own_tab():
+    d = _daemon(PERSON)
 
-    asyncio.run(d.handle({
-        "meta": "set_session",
-        "session_id": "session-NEW",
-        "target_id": "target-NEW",
-    }))
+    _run(d, cmd("a"), cmd("b"), cmd("a"), cmd("b"))
 
-    disabled = [
-        (method, sid) for (method, _params, sid) in d.cdp.calls
-        if method == "Network.disable"
-    ]
-    assert disabled == [("Network.disable", "session-OLD")], (
-        f"Network.disable must fire on the old session before re-enabling on "
-        f"the new one. Got: {disabled}"
-    )
-
-    # Sanity: the new session still gets Network.enable.
-    enabled_on_new = {
-        method for (method, _p, sid) in d.cdp.calls
-        if sid == "session-NEW" and method.endswith(".enable")
-    }
-    assert "Network.enable" in enabled_on_new
+    assert [d.cdp.tab_of(s) for s in d.cdp.sent("Input.insertText")] == ["tab-1", "tab-3", "tab-1", "tab-3"]
+    assert d.tab_owner == {"tab-1": "a", "tab-3": "b"}
 
 
-def test_set_session_does_not_disable_network_when_no_previous_session():
-    """First set_session call (e.g. very early in startup before any attach)
-    has no old_session — the Network.disable path must be skipped."""
-    d = _fresh_daemon()
-    d.session = None  # no prior attach
+def test_concurrent_first_commands_of_one_owner_open_one_tab():
+    d = _daemon()
 
-    asyncio.run(d.handle({
-        "meta": "set_session",
-        "session_id": "session-FIRST",
-        "target_id": "target-FIRST",
-    }))
+    async def go():
+        return await asyncio.gather(d.handle(cmd("a")), d.handle(cmd("a")))
+    asyncio.run(go())
 
-    disables = [m for (m, _p, _s) in d.cdp.calls if m == "Network.disable"]
-    assert disables == [], (
-        f"Network.disable must not fire when there's no previous session "
-        f"to disable. Got: {disables}"
-    )
+    assert len(d.cdp.sent("Target.createTarget")) == 1
+    assert len(d.cdp.sent("Target.attachToTarget")) == 1
 
 
-def test_set_session_runs_disable_and_enables_in_parallel():
-    """The four Domain.enable calls (plus Network.disable on the old session)
-    must run concurrently via asyncio.gather, not sequentially. With the old
-    sequential code, helpers.switch_tab() would block in _send() for up to
-    ~22s on a slow/remote daemon while the helper's IPC socket has a 5s
-    read timeout, causing client-side socket timeouts. Verifying that all
-    five CDP calls reach send_raw before any returns proves parallelization."""
-    class _ConcurrencyProbeCDP:
-        def __init__(self):
-            self.calls = []
-            self.in_flight = 0
-            self.max_concurrent = 0
-            self.release = None  # asyncio.Event, set inside the test loop
+def test_cloud_owner_adopts_the_spare_blank_tab(monkeypatch):
+    """A cloud browser is exclusive and its live view shows the first tab."""
+    monkeypatch.setattr(daemon, "REMOTE_ID", "cloud-browser")
+    d = _daemon(("cloud-blank", "about:blank"))
 
-        async def send_raw(self, method, params=None, session_id=None):
-            self.calls.append((method, params, session_id))
-            self.in_flight += 1
-            self.max_concurrent = max(self.max_concurrent, self.in_flight)
-            try:
-                await self.release.wait()
-            finally:
-                self.in_flight -= 1
-            return {}
+    _run(d, cmd("a"))
 
-    async def run():
-        d = daemon.Daemon()
-        d.cdp = _ConcurrencyProbeCDP()
-        d.session = "session-OLD"  # ensures Network.disable on old fires
-        d.cdp.release = asyncio.Event()
-
-        handle_task = asyncio.create_task(d.handle({
-            "meta": "set_session",
-            "session_id": "session-NEW",
-            "target_id": "target-NEW",
-        }))
-        # Yield repeatedly until everything that's going to be in-flight is
-        # in-flight. Cap iterations to avoid hanging if parallelization breaks.
-        for _ in range(50):
-            await asyncio.sleep(0)
-            # 5 = Network.disable on OLD + 4 enables on NEW.
-            if d.cdp.in_flight >= 5:
-                break
-        peak = d.cdp.max_concurrent
-        d.cdp.release.set()
-        await handle_task
-        return peak, d.cdp.calls
-
-    peak, calls = asyncio.run(run())
-    assert peak == 5, (
-        f"set_session must run disable + 4 enables concurrently via gather "
-        f"(observed peak in-flight = {peak}; expected 5 = 1 disable on OLD + "
-        f"4 enables on NEW). Sequential await would peak at 1."
-    )
-    # Sanity: the right calls were made.
-    methods = sorted({m for (m, _p, _s) in calls})
-    assert "Network.disable" in methods
-    assert {"Page.enable", "DOM.enable", "Runtime.enable", "Network.enable"}.issubset(methods)
+    assert d.cdp.sent("Target.createTarget") == []
+    assert d.tab_owner == {"cloud-blank": "a"}
 
 
-def test_set_session_first_attach_runs_four_enables_in_parallel():
-    """When there's no previous session, the disable path is skipped — only
-    the four enables run, still in parallel."""
-    class _ConcurrencyProbeCDP:
-        def __init__(self):
-            self.calls = []
-            self.in_flight = 0
-            self.max_concurrent = 0
-            self.release = None
+def test_switch_tab_takes_a_free_tab_in_the_background():
+    d = _daemon(PERSON)
 
-        async def send_raw(self, method, params=None, session_id=None):
-            self.calls.append((method, params, session_id))
-            self.in_flight += 1
-            self.max_concurrent = max(self.max_concurrent, self.in_flight)
-            try:
-                await self.release.wait()
-            finally:
-                self.in_flight -= 1
-            return {}
+    [r] = _run(d, meta("a", "switch_tab", target_id="person-tab"))
 
-    async def run():
-        d = daemon.Daemon()
-        d.cdp = _ConcurrencyProbeCDP()
-        d.session = None  # no previous session
-        d.cdp.release = asyncio.Event()
-
-        handle_task = asyncio.create_task(d.handle({
-            "meta": "set_session",
-            "session_id": "session-FIRST",
-            "target_id": "target-FIRST",
-        }))
-        for _ in range(50):
-            await asyncio.sleep(0)
-            if d.cdp.in_flight >= 4:
-                break
-        peak = d.cdp.max_concurrent
-        d.cdp.release.set()
-        await handle_task
-        return peak
-
-    peak = asyncio.run(run())
-    assert peak == 4, (
-        f"first set_session must run 4 enables concurrently "
-        f"(observed peak = {peak}). No Network.disable should fire."
-    )
-
-
-def test_current_tab_meta_passes_attached_target_id():
-    """Regression for issue #304: helpers.current_tab() previously sent
-    Target.getTargetInfo with no targetId. The daemon strips session_id for
-    Target.* methods, so the call hit the browser-level connection with empty
-    params, and Chrome returned info about the *browser* target (empty
-    url/title) instead of the attached page. The daemon now resolves this
-    server-side using its tracked target_id."""
-    class _TargetInfoCDP(_FakeCDP):
-        async def send_raw(self, method, params=None, session_id=None):
-            self.calls.append((method, params, session_id))
-            if method == "Target.getTargetInfo":
-                return {"targetInfo": {
-                    "targetId": params["targetId"],
-                    "url": "https://example.com/",
-                    "title": "Example Domain",
-                    "type": "page",
-                }}
-            return {}
-
-    d = daemon.Daemon()
-    d.cdp = _TargetInfoCDP()
-    d.target_id = "page-target-abc"
-
-    result = asyncio.run(d.handle({"meta": "current_tab"}))
-
-    assert result == {
-        "targetId": "page-target-abc",
-        "url": "https://example.com/",
-        "title": "Example Domain",
-    }
-    # The targetId must be passed through — that's the whole point of the fix.
-    get_info_calls = [(p, s) for (m, p, s) in d.cdp.calls if m == "Target.getTargetInfo"]
-    assert get_info_calls == [({"targetId": "page-target-abc"}, None)]
-
-
-def test_current_tab_meta_returns_not_attached_when_no_target_id():
-    """Without an attached page, current_tab() has no meaningful answer.
-    Returning {error: not_attached} causes _send() to raise in helpers, which
-    is the right signal for callers like ensure_real_tab() that wrap the call
-    in try/except."""
-    d = _fresh_daemon()
-    d.target_id = None
-
-    result = asyncio.run(d.handle({"meta": "current_tab"}))
-
-    assert result == {"error": "not_attached"}
-    # No CDP call should have been issued.
-    assert d.cdp.calls == []
-
-
-class _AttachCDP(_FakeCDP):
-    """FakeCDP with realistic responses for the attach flow."""
-
-    def __init__(self, targets=None, fail_method=None):
-        super().__init__()
-        self.targets = targets or []
-        self.created = 0
-        self.closed = []
-        self.fail_method = fail_method
-
-    async def send_raw(self, method, params=None, session_id=None):
-        self.calls.append((method, params, session_id))
-        if method == self.fail_method:
-            raise RuntimeError(f"simulated {method} failure")
-        if method == "Target.getTargets":
-            return {"targetInfos": self.targets}
-        if method == "Target.createTarget":
-            self.created += 1
-            tid = f"created-{self.created}"
-            self.targets.append({"targetId": tid, "url": "about:blank", "type": "page"})
-            return {"targetId": tid}
-        if method == "Target.attachToTarget":
-            return {"sessionId": f"session-for-{params['targetId']}"}
-        if method == "Target.closeTarget":
-            self.closed.append(params["targetId"])
-        return {}
-
-
-def test_named_daemon_creates_dedicated_tab(monkeypatch):
-    """Named local/CDP daemons must not fight over the first existing tab."""
-    monkeypatch.setattr(daemon, "NAME", "worker-a")
-    monkeypatch.setattr(daemon, "REMOTE_ID", None)
-    monkeypatch.setattr(daemon, "BROWSER_KIND", "cdp")
-    existing = [{"targetId": "someone-elses-tab", "url": "https://example.com/", "type": "page"}]
-    d = daemon.Daemon()
-    d.cdp = _AttachCDP(existing)
-
-    page = asyncio.run(d.attach_first_page())
-
-    assert page["targetId"] == "created-1"
-    assert d.target_id == "created-1"
-    assert d.dedicated_target_id == "created-1"
-    assert d.session == "session-for-created-1"
-    attach_calls = [p for (m, p, _s) in d.cdp.calls if m == "Target.attachToTarget"]
-    assert attach_calls == [{"targetId": "created-1", "flatten": True}]
-    create_calls = [p for (m, p, _s) in d.cdp.calls if m == "Target.createTarget"]
-    assert create_calls == [{"url": "about:blank", "background": True}]
-    enabled = {m for (m, _p, s) in d.cdp.calls if s == d.session and m.endswith(".enable")}
+    assert r["target_id"] == "person-tab" and d.tab_owner == {"person-tab": "a"}
+    assert d.cdp.sent("Target.activateTarget") == []
+    enabled = {m for m, _p, s in d.cdp.calls if s == r["session_id"] and m.endswith(".enable")}
     assert enabled == {"Page.enable", "DOM.enable", "Runtime.enable", "Network.enable"}
 
 
-def test_default_daemon_still_attaches_first_page(monkeypatch):
-    """The default daemon keeps reusing the user's first real page."""
-    monkeypatch.setattr(daemon, "NAME", "default")
-    monkeypatch.setattr(daemon, "REMOTE_ID", None)
-    existing = [{"targetId": "user-tab", "url": "https://example.com/", "type": "page"}]
-    d = daemon.Daemon()
-    d.cdp = _AttachCDP(existing)
+def test_switch_tab_activates_only_when_asked():
+    d = _daemon(PERSON)
 
-    page = asyncio.run(d.attach_first_page())
+    _run(d, meta("a", "switch_tab", target_id="person-tab", activate=True))
 
-    assert page["targetId"] == "user-tab"
-    assert d.dedicated_target_id is None
-    assert d.cdp.created == 0
+    assert [p for m, p, _s in d.cdp.calls if m == "Target.activateTarget"] == [{"targetId": "person-tab"}]
 
 
-def test_default_daemon_creates_missing_page_in_background(monkeypatch):
-    """Fallback tabs must not steal the user's foreground Chrome tab."""
-    monkeypatch.setattr(daemon, "NAME", "default")
-    monkeypatch.setattr(daemon, "REMOTE_ID", None)
-    monkeypatch.setattr(daemon, "BROWSER_KIND", "cdp")
-    d = daemon.Daemon()
-    d.cdp = _AttachCDP()
+def test_switch_to_another_owners_tab_is_tab_taken_and_attaches_nothing():
+    d = _daemon(PERSON)
+    _run(d, meta("a", "switch_tab", target_id="person-tab"))
+    attaches = len(d.cdp.sent("Target.attachToTarget"))
 
-    page = asyncio.run(d.attach_first_page())
+    [r] = _run(d, meta("b", "switch_tab", target_id="person-tab"))
 
-    assert page["targetId"] == "created-1"
-    create_calls = [p for (m, p, _s) in d.cdp.calls if m == "Target.createTarget"]
-    assert create_calls == [{"url": "about:blank", "background": True}]
+    assert r["error"].startswith("tab-taken: tab person-tab is driven by another agent. Nothing was sent.")
+    assert len(d.cdp.sent("Target.attachToTarget")) == attaches
+    assert d.tab_owner == {"person-tab": "a"}
 
 
-def test_named_remote_daemon_keeps_first_page_attach(monkeypatch):
-    """A cloud browser is exclusive, so a named cloud daemon needs no extra tab."""
-    monkeypatch.setattr(daemon, "NAME", "r7k2")
-    monkeypatch.setattr(daemon, "REMOTE_ID", "remote-browser-id")
-    monkeypatch.setattr(daemon, "BROWSER_KIND", "cloud")
-    existing = [{"targetId": "cloud-blank", "url": "about:blank", "type": "page"}]
-    d = daemon.Daemon()
-    d.cdp = _AttachCDP(existing)
+def test_switch_tab_with_a_moved_url_is_tab_changed():
+    d = _daemon(PERSON)
 
-    page = asyncio.run(d.attach_first_page())
+    [r] = _run(d, meta("a", "switch_tab", target_id="person-tab", url="https://mail.example/old"))
 
-    assert page["targetId"] == "cloud-blank"
-    assert d.dedicated_target_id is None
-    assert d.cdp.created == 0
+    assert r["error"].startswith("tab-changed: tab person-tab now shows https://mail.example/")
+    assert d.tab_owner == {}
 
 
-def test_named_reattach_reuses_dedicated_tab(monkeypatch):
-    """A stale CDP session should not replace a tab that still exists."""
-    monkeypatch.setattr(daemon, "NAME", "worker-a")
-    monkeypatch.setattr(daemon, "REMOTE_ID", None)
-    monkeypatch.setattr(daemon, "BROWSER_KIND", "cdp")
-    d = daemon.Daemon()
-    d.cdp = _AttachCDP()
+def test_switch_to_a_missing_tab_is_tab_closed():
+    d = _daemon()
 
-    asyncio.run(d.attach_first_page())
-    asyncio.run(d.attach_first_page())
+    [r] = _run(d, meta("a", "switch_tab", target_id="gone-tab"))
 
-    assert d.cdp.created == 1
-    assert d.cdp.closed == []
-    assert d.target_id == "created-1"
-    assert d.dedicated_target_id == "created-1"
+    assert r["error"].startswith("tab-closed: tab gone-tab does not exist.")
 
 
-def test_named_reattach_keeps_selected_tab_when_it_still_exists(monkeypatch):
-    """A deliberate switch_tab remains the active tab after session recovery."""
-    monkeypatch.setattr(daemon, "NAME", "worker-a")
-    monkeypatch.setattr(daemon, "REMOTE_ID", None)
-    monkeypatch.setattr(daemon, "BROWSER_KIND", "cdp")
-    d = daemon.Daemon()
-    d.cdp = _AttachCDP()
+@pytest.mark.parametrize("method", ["Target.attachToTarget", "Target.closeTarget", "Target.activateTarget"])
+def test_raw_target_calls_on_another_owners_tab_are_tab_taken(method):
+    d = _daemon()
+    _run(d, cmd("a"))
+    sent = len(d.cdp.calls)
 
-    asyncio.run(d.attach_first_page())
-    d.cdp.targets.append({"targetId": "selected-tab", "url": "https://example.com", "type": "page"})
-    d.target_id = "selected-tab"
-    asyncio.run(d.attach_first_page())
+    [r] = _run(d, cmd("b", method, targetId="tab-1"))
 
-    assert d.cdp.created == 1
-    assert d.cdp.closed == []
-    assert d.target_id == "selected-tab"
-    assert d.dedicated_target_id == "created-1"
-    assert d.session == "session-for-selected-tab"
+    assert r["error"].startswith("tab-taken:")
+    assert len(d.cdp.calls) == sent
 
 
-def test_named_reattach_creates_replacement_only_when_tab_is_gone(monkeypatch):
-    """If the user closes the dedicated tab, the daemon creates one replacement."""
-    monkeypatch.setattr(daemon, "NAME", "worker-a")
-    monkeypatch.setattr(daemon, "REMOTE_ID", None)
-    monkeypatch.setattr(daemon, "BROWSER_KIND", "cdp")
-    d = daemon.Daemon()
-    d.cdp = _AttachCDP()
+def test_raw_attach_session_belongs_to_its_owner():
+    d = _daemon(("frame", "https://ads.example/"))
+    [r] = _run(d, cmd("a", "Target.attachToTarget", targetId="frame", flatten=True))
+    sid = r["result"]["sessionId"]
 
-    asyncio.run(d.attach_first_page())
-    d.cdp.targets = [t for t in d.cdp.targets if t["targetId"] != "created-1"]
-    asyncio.run(d.attach_first_page())
+    a, b = _run(d, {**cmd("a", "Runtime.evaluate", expression="1"), "session_id": sid},
+                {**cmd("b", "Runtime.evaluate", expression="1"), "session_id": sid})
 
-    assert d.cdp.created == 2
-    assert d.cdp.closed == []
-    assert d.target_id == "created-2"
-    assert d.dedicated_target_id == "created-2"
+    assert a == {"result": {}}
+    assert b["error"].startswith("tab-taken:")
 
 
-def test_concurrent_named_reattach_creates_one_replacement(monkeypatch):
-    """Concurrent recovery after a user closes the tab shares one replacement."""
-    class _ConcurrentAttachCDP(_AttachCDP):
-        def __init__(self):
-            super().__init__()
-            self.get_calls = 0
-            self.first_gets_done = asyncio.Event()
+def test_close_tab_closes_only_your_tabs():
+    d = _daemon(PERSON)
+    _run(d, cmd("a"))
 
-        async def send_raw(self, method, params=None, session_id=None):
-            if method == "Target.getTargets":
-                self.calls.append((method, params, session_id))
-                snapshot = list(self.targets)
-                self.get_calls += 1
-                if self.get_calls <= 2:
-                    if self.get_calls == 2:
-                        self.first_gets_done.set()
-                    await self.first_gets_done.wait()
-                return {"targetInfos": snapshot}
-            return await super().send_raw(method, params, session_id)
+    other, person, own = _run(d, meta("b", "close_tab", target_id="tab-1"),
+                              meta("b", "close_tab", target_id="person-tab"),
+                              meta("a", "close_tab"))
 
-    async def run():
-        d = daemon.Daemon()
-        d.cdp = _ConcurrentAttachCDP()
-        pages = await asyncio.gather(d.attach_first_page(), d.attach_first_page())
-        return d, pages
-
-    monkeypatch.setattr(daemon, "NAME", "worker-a")
-    monkeypatch.setattr(daemon, "REMOTE_ID", None)
-    monkeypatch.setattr(daemon, "BROWSER_KIND", "cdp")
-    d, pages = asyncio.run(run())
-
-    assert [page["targetId"] for page in pages] == ["created-1", "created-1"]
-    assert d.cdp.created == 1
-    assert d.cdp.closed == []
-    assert d.target_id == "created-1"
-    assert d.dedicated_target_id == "created-1"
+    assert other["error"].startswith("tab-taken:")
+    assert person["error"] == "close_tab: tab person-tab is not yours; switch_tab() to it first"
+    assert own == {"closed": "tab-1"}
+    assert list(d.cdp.pages) == ["person-tab"]
 
 
-def test_named_attach_failure_reuses_created_tab_on_retry(monkeypatch):
-    """A transient attach failure leaves the tab available for the next retry."""
-    class _FailOnceAttachCDP(_AttachCDP):
-        def __init__(self):
-            super().__init__()
-            self.fail_attach = True
+def test_after_closing_your_tab_the_next_command_is_tab_closed_once():
+    """Nothing is sent to any other tab; the command after that opens a fresh tab."""
+    d = _daemon(PERSON)
+    _run(d, cmd("a"))
 
-        async def send_raw(self, method, params=None, session_id=None):
-            if method == "Target.attachToTarget" and self.fail_attach:
-                self.calls.append((method, params, session_id))
-                self.fail_attach = False
-                raise RuntimeError("simulated Target.attachToTarget failure")
-            return await super().send_raw(method, params, session_id)
+    _, gone, fresh = _run(d, meta("a", "close_tab"), cmd("a", "Page.navigate", url="https://x.example/"), cmd("a"))
 
-    monkeypatch.setattr(daemon, "NAME", "worker-a")
-    monkeypatch.setattr(daemon, "REMOTE_ID", None)
-    monkeypatch.setattr(daemon, "BROWSER_KIND", "cdp")
-    d = daemon.Daemon()
-    d.cdp = _FailOnceAttachCDP()
-
-    with pytest.raises(RuntimeError, match="Target.attachToTarget"):
-        asyncio.run(d.attach_first_page())
-    page = asyncio.run(d.attach_first_page())
-
-    assert page["targetId"] == "created-1"
-    assert d.cdp.created == 1
-    assert d.cdp.closed == []
-    assert d.dedicated_target_id == "created-1"
+    assert gone["error"].startswith("tab-closed: your tab tab-1")
+    assert d.cdp.sent("Page.navigate") == []
+    assert fresh == {"result": {}} and d.tab_owner == {"tab-3": "a"}
 
 
-def test_named_local_attach_cleans_inspect_tabs_before_return(monkeypatch):
-    """The named-daemon early path must retain local inspect-tab cleanup."""
-    monkeypatch.setattr(daemon, "NAME", "worker-a")
-    monkeypatch.setattr(daemon, "REMOTE_ID", None)
-    monkeypatch.setattr(daemon, "BROWSER_KIND", "local")
-    monkeypatch.setattr(daemon, "harness_opened_inspect", lambda: True)
-    inspect = {"targetId": "inspect-tab", "url": "chrome://inspect/#remote-debugging", "type": "page"}
-    d = daemon.Daemon()
-    d.cdp = _AttachCDP([inspect])
+def test_person_closing_your_tab_is_tab_closed_once():
+    d = _daemon(PERSON)
+    _run(d, cmd("a"))
+    d.cdp.pages.pop("tab-1")
+    d._record_event("Target.targetDestroyed", {"targetId": "tab-1"})
 
-    asyncio.run(d.attach_first_page())
+    [r] = _run(d, cmd("a"))
 
-    methods = [method for method, _params, _session in d.cdp.calls]
-    assert methods.index("Target.closeTarget") < methods.index("Target.createTarget")
-    assert d.cdp.closed == ["inspect-tab"]
+    assert r["error"].startswith("tab-closed: your tab tab-1")
+    assert [d.cdp.tab_of(s) for s in d.cdp.sent("Input.insertText")] == ["tab-1"]
 
 
-def test_shutdown_closes_only_the_daemon_owned_tab(monkeypatch):
-    """Run cleanup closes the daemon-created tab without touching a user tab."""
-    d = daemon.Daemon()
-    d.cdp = _AttachCDP()
+def test_crash_is_tab_crashed_once():
+    d = _daemon()
+    _run(d, cmd("a"))
+    d._record_event("Target.targetCrashed", {"targetId": "tab-1"})
 
-    async def start():
-        d.dedicated_target_id = "daemon-tab"
-        d.target_id = "user-selected-tab"
-        d.stop = asyncio.Event()
-        d.stop.set()
+    crashed, after = _run(d, cmd("a"), cmd("a"))
 
-    async def wait_forever(*_args):
-        await asyncio.Event().wait()
-
-    d.start = start
-    monkeypatch.setattr(daemon, "Daemon", lambda: d)
-    monkeypatch.setattr(daemon.ipc, "serve", wait_forever)
-    monkeypatch.setattr(daemon.ipc, "sock_addr", lambda _name: "test-socket")
-    monkeypatch.setattr(daemon.ipc, "cleanup_endpoint", lambda _name: None)
-    monkeypatch.setattr(daemon, "log", lambda _message: None)
-
-    asyncio.run(daemon.main())
-
-    assert d.cdp.closed == ["daemon-tab"]
-    assert d.dedicated_target_id is None
-    assert d.target_id == "user-selected-tab"
+    assert crashed["error"].startswith("tab-crashed: your tab tab-1")
+    assert after == {"result": {}}
+    assert len(d.cdp.sent("Input.insertText")) == 2
 
 
-def test_delayed_stale_request_follows_recovery_during_domain_enable(monkeypatch):
-    """Publish the replacement before post-attach domain setup can yield."""
-    class _RecoveryWindowCDP(_FakeCDP):
-        def __init__(self):
-            super().__init__()
-            self.slow_started = None
-            self.release_slow = None
-            self.enable_started = None
-            self.release_enables = None
+def test_new_tab_reuses_an_empty_current_tab_only_for_a_url():
+    d = _daemon(("blank", "data:text/html,"))
+    _run(d, meta("a", "switch_tab", target_id="blank"))
 
-        async def send_raw(self, method, params=None, session_id=None):
-            self.calls.append((method, params, session_id))
-            if method == "Runtime.evaluate" and session_id == "stale-session":
-                if params["expression"] == "slow":
-                    self.slow_started.set()
-                    await self.release_slow.wait()
-                raise RuntimeError("Session with given id not found")
-            if method == "Target.getTargets":
-                return {"targetInfos": [
-                    {"targetId": "same-tab", "url": "https://example.com", "type": "page"}
-                ]}
-            if method == "Target.attachToTarget":
-                return {"sessionId": "replacement-session"}
-            if method.endswith(".enable") and session_id == "replacement-session":
-                self.enable_started.set()
-                await self.release_enables.wait()
-                return {}
-            if method == "Runtime.evaluate" and session_id == "replacement-session":
-                return {"value": params["expression"]}
-            return {}
+    reused, fresh = _run(d, meta("a", "new_tab", reuse=True), meta("a", "new_tab", reuse=False))
 
-    async def run():
-        d = daemon.Daemon()
-        d.cdp = _RecoveryWindowCDP()
-        d.cdp.slow_started = asyncio.Event()
-        d.cdp.release_slow = asyncio.Event()
-        d.cdp.enable_started = asyncio.Event()
-        d.cdp.release_enables = asyncio.Event()
-        d.session = "stale-session"
-        d.target_id = "same-tab"
-
-        slow = asyncio.create_task(d.handle({
-            "method": "Runtime.evaluate", "params": {"expression": "slow"}
-        }))
-        await d.cdp.slow_started.wait()
-        fast = asyncio.create_task(d.handle({
-            "method": "Runtime.evaluate", "params": {"expression": "fast"}
-        }))
-        await d.cdp.enable_started.wait()
-        # Recovery has attached but is still blocked enabling domains. The
-        # delayed request must already be able to find the replacement.
-        d.cdp.release_slow.set()
-        slow_result = await slow
-        d.cdp.release_enables.set()
-        return d, await fast, slow_result
-
-    monkeypatch.setattr(daemon, "NAME", "default")
-    monkeypatch.setattr(daemon, "BROWSER_KIND", "cdp")
-    d, fast, slow = asyncio.run(run())
-
-    assert fast == {"result": {"value": "fast"}}
-    assert slow == {"result": {"value": "slow"}}
-    assert d._session_replacements == {"stale-session": "replacement-session"}
+    assert reused["target_id"] == "blank"
+    assert fresh["target_id"] == "tab-2"
+    assert [p for m, p, _s in d.cdp.calls if m == "Target.createTarget"] == [{"url": "about:blank", "background": True}]
 
 
-def test_tab_switch_waits_for_recovery_and_keeps_old_action_on_old_tab(monkeypatch):
-    """A switch during target discovery cannot redirect the recovered action."""
-    class _SwitchRaceCDP(_FakeCDP):
-        def __init__(self):
-            super().__init__()
-            self.discovery_started = None
-            self.release_discovery = None
+def test_new_tab_clears_a_pending_tab_closed():
+    d = _daemon()
+    _run(d, cmd("a"), meta("a", "close_tab"))
 
-        async def send_raw(self, method, params=None, session_id=None):
-            self.calls.append((method, params, session_id))
-            if (
-                method == "Runtime.evaluate"
-                and params.get("expression") == "old-tab-action"
-                and session_id == "old-session"
-            ):
-                raise RuntimeError("Session with given id not found")
-            if method == "Target.getTargets":
-                self.discovery_started.set()
-                await self.release_discovery.wait()
-                return {"targetInfos": [
-                    {"targetId": "old-tab", "url": "https://example.com", "type": "page"}
-                ]}
-            if method == "Target.attachToTarget":
-                return {"sessionId": "recovered-old-session"}
-            if (
-                method == "Runtime.evaluate"
-                and params.get("expression") == "old-tab-action"
-                and session_id == "recovered-old-session"
-            ):
-                return {"value": "old-tab-action"}
-            return {}
+    _, r = _run(d, meta("a", "new_tab"), cmd("a"))
 
-    async def run():
-        d = daemon.Daemon()
-        d.cdp = _SwitchRaceCDP()
-        d.cdp.discovery_started = asyncio.Event()
-        d.cdp.release_discovery = asyncio.Event()
-        d.session = "old-session"
-        d.target_id = "old-tab"
+    assert r == {"result": {}}
 
-        request = asyncio.create_task(d.handle({
-            "method": "Runtime.evaluate",
-            "params": {"expression": "old-tab-action"},
-        }))
-        await d.cdp.discovery_started.wait()
-        switch = asyncio.create_task(d.handle({
-            "meta": "set_session",
-            "session_id": "new-session",
-            "target_id": "new-tab",
-        }))
-        await asyncio.sleep(0)  # let set_session wait on the recovery lock
-        d.cdp.release_discovery.set()
-        result, switch_result = await asyncio.gather(request, switch)
-        await asyncio.sleep(0)  # let the cosmetic marker task finish
-        return d, result, switch_result
 
-    monkeypatch.setattr(daemon, "NAME", "default")
-    monkeypatch.setattr(daemon, "BROWSER_KIND", "cdp")
-    d, result, switch_result = asyncio.run(run())
+def test_popup_belongs_to_its_openers_owner():
+    d = _daemon()
+    _run(d, cmd("a"))
 
-    assert result == {"result": {"value": "old-tab-action"}}
-    assert switch_result == {"session_id": "new-session"}
-    assert d.session == "new-session"
-    assert d.target_id == "new-tab"
-    assert d._session_replacements == {"old-session": "recovered-old-session"}
-    redirected = [
-        (params, sid)
-        for method, params, sid in d.cdp.calls
-        if method == "Runtime.evaluate"
-        and params.get("expression") == "old-tab-action"
-        and sid == "new-session"
-    ]
-    assert redirected == []
+    d._record_event("Target.targetCreated", {"targetInfo": {"targetId": "popup", "type": "page", "url": "", "openerId": "tab-1"}})
+
+    assert d.tab_owner["popup"] == "a"
+    assert d.owners["a"].current == "tab-1"
+
+
+def test_events_and_dialogs_belong_to_their_owner():
+    d = _daemon()
+    _run(d, cmd("a"), cmd("b"))
+    sa, sb = d.owners["a"].tabs["tab-1"], d.owners["b"].tabs["tab-3"]
+
+    d._record_event("Network.requestWillBeSent", {"requestId": "1"}, sa)
+    d._record_event("Page.javascriptDialogOpening", {"message": "hi"}, sb)
+    d._record_event("Browser.downloadProgress", {"guid": "g"})
+    d._record_event("Network.requestWillBeSent", {"requestId": "2"}, "unknown-session")
+
+    ea, eb, da, db = _run(d, meta("a", "drain_events"), meta("b", "drain_events"),
+                          meta("a", "pending_dialog"), meta("b", "pending_dialog"))
+    assert [e["method"] for e in ea["events"]] == ["Network.requestWillBeSent", "Browser.downloadProgress"]
+    assert [e["method"] for e in eb["events"]] == ["Page.javascriptDialogOpening", "Browser.downloadProgress"]
+    assert da == {"dialog": None} and db == {"dialog": {"message": "hi"}}
+
+
+def test_auto_attached_child_sessions_belong_to_their_owner():
+    d = _daemon()
+    _run(d, cmd("a"))
+    sa = d.owners["a"].tabs["tab-1"]
+
+    d._record_event("Target.attachedToTarget", {"sessionId": "iframe-session", "targetInfo": {"targetId": "f"}}, sa)
+
+    assert d.session_owner["iframe-session"] == "a"
+
+
+def test_tabs_meta_shows_you_taken_or_free():
+    d = _daemon(PERSON)
+    _run(d, cmd("a"), cmd("b"))
+
+    [r] = _run(d, meta("a", "tabs"))
+
+    assert {t["targetId"]: t["owner"] for t in r["tabs"]} == {"person-tab": None, "tab-1": "you", "tab-3": "taken"}
+
+
+def test_detached_session_reattaches_the_same_tab_on_next_use():
+    d = _daemon()
+    _run(d, cmd("a"))
+    d._record_event("Target.detachedFromTarget", {"sessionId": d.owners["a"].tabs["tab-1"], "targetId": "tab-1"})
+
+    _run(d, cmd("a"))
+
+    assert [p["targetId"] for m, p, _s in d.cdp.calls if m == "Target.attachToTarget"] == ["tab-1", "tab-1"]
+
+
+def test_current_tab_meta_passes_the_owners_target_id():
+    """Regression for issue #304: Target.getTargetInfo needs the targetId."""
+    d = _daemon(PERSON)
+    _run(d, meta("a", "switch_tab", target_id="person-tab"))
+
+    [r] = _run(d, meta("a", "current_tab"))
+
+    assert r == {"targetId": "person-tab", "url": "https://mail.example/", "title": "person-tab"}
+    assert [p for m, p, s in d.cdp.calls if m == "Target.getTargetInfo"][-1] == {"targetId": "person-tab"}
+
+
+def test_connection_status_is_healthy_before_any_tab():
+    d = _daemon(PERSON)
+
+    [r] = _run(d, meta("a", "connection_status"))
+
+    assert r == {"target_id": None, "session_id": None, "page": None}
+    assert d.cdp.sent("Target.createTarget") == []
+
+
+# --- stale sessions (S1) ---
+
+def test_stale_session_never_replays_onto_another_tab():
+    """S1: the agent's tab is gone; the person's tab must not receive the command."""
+    d = _daemon(PERSON)
+    _run(d, cmd("a"))
+    d.cdp.stale.add(d.owners["a"].tabs["tab-1"])
+    d.cdp.pages.pop("tab-1")
+
+    [r] = _run(d, cmd("a"))
+
+    assert r["error"].startswith("tab-closed: your tab tab-1")
+    assert [p["targetId"] for m, p, _s in d.cdp.calls if m == "Target.attachToTarget"] == ["tab-1", "tab-1"]
+    assert [d.cdp.tab_of(s) for s in d.cdp.sent("Input.insertText")] == ["tab-1", "tab-1"]
+    assert d.tab_owner == {}
+
+
+def test_stale_session_reattaches_the_same_tab_once():
+    d = _daemon(PERSON)
+    _run(d, cmd("a"))
+    stale = d.owners["a"].tabs["tab-1"]
+    d.cdp.stale.add(stale)
+
+    [r] = _run(d, cmd("a"))
+
+    assert r == {"result": {}}
+    assert [d.cdp.tab_of(s) for s in d.cdp.sent("Input.insertText")] == ["tab-1", "tab-1", "tab-1"]
+    assert d.owners["a"].tabs["tab-1"] != stale
+
+
+def test_concurrent_stale_requests_reattach_once():
+    d = _daemon()
+    _run(d, cmd("a"))
+    d.cdp.stale.add(d.owners["a"].tabs["tab-1"])
+
+    async def go():
+        return await asyncio.gather(d.handle(cmd("a")), d.handle(cmd("a")))
+    results = asyncio.run(go())
+
+    assert results == [{"result": {}}, {"result": {}}]
+    assert len(d.cdp.sent("Target.attachToTarget")) == 2  # first use + one reattach
+
+
+def test_stale_request_stays_on_its_tab_when_the_owner_switches_meanwhile():
+    d = _daemon(PERSON)
+    _run(d, cmd("a"))
+    d.cdp.stale.add(d.owners["a"].tabs["tab-1"])
+    gate = asyncio.Event()
+    real = d.cdp.send_raw
+
+    async def slow_reattach(method, params=None, session_id=None):
+        if method == "Target.attachToTarget" and params["targetId"] == "tab-1":
+            await gate.wait()
+        return await real(method, params, session_id)
+    d.cdp.send_raw = slow_reattach
+
+    async def go():
+        stale = asyncio.create_task(d.handle(cmd("a", text="old-tab-action")))
+        await asyncio.sleep(0.01)
+        switch = asyncio.create_task(d.handle(meta("a", "switch_tab", target_id="person-tab")))
+        await asyncio.sleep(0.01)
+        gate.set()
+        return await stale, await switch
+    result, switched = asyncio.run(go())
+
+    assert result == {"result": {}} and switched["target_id"] == "person-tab"
+    actions = [s for m, p, s in d.cdp.calls if m == "Input.insertText" and p == {"text": "old-tab-action"}]
+    assert [d.cdp.tab_of(s) for s in actions] == ["tab-1", "tab-1"]
+
+
+def test_failed_attach_keeps_the_tab_for_the_retry():
+    d = _daemon()
+    d.cdp.fail["Target.attachToTarget"] = RuntimeError("simulated attach failure")
+
+    first, second = _run(d, cmd("a"), cmd("a"))
+
+    assert first["error"] == "simulated attach failure"
+    assert second == {"result": {}}
+    assert len(d.cdp.sent("Target.createTarget")) == 1
 
 
 def test_explicit_stale_session_is_not_redirected():
-    """Explicit session requests retain their exact-session semantics."""
-    class _AlwaysStaleCDP(_FakeCDP):
+    """Explicit session requests keep their exact-session semantics."""
+    d = _daemon()
+    d.cdp.stale.add("explicit-stale-session")
+
+    [r] = _run(d, {**cmd("a", "Runtime.evaluate", expression="1"), "session_id": "explicit-stale-session"})
+
+    assert "Session with given id not found" in r["error"]
+    assert d.cdp.calls == [("Runtime.evaluate", {"expression": "1"}, "explicit-stale-session")]
+
+
+# --- tab marker and domains ---
+
+@pytest.mark.parametrize("value", ["0", "false", "NO", "off"])
+def test_tab_marker_can_be_disabled(monkeypatch, value):
+    monkeypatch.setenv("BH_TAB_MARKER", value)
+    d = _daemon()
+
+    async def go():
+        await d.handle(cmd("a"))
+        d._record_event("Page.loadEventFired", {}, d.owners["a"].tabs["tab-1"])
+        await asyncio.sleep(0)
+    asyncio.run(go())
+
+    assert d.cdp.sent("Runtime.evaluate") == []
+
+
+def test_tab_marker_marks_owned_tabs_on_attach_and_load(monkeypatch):
+    monkeypatch.delenv("BH_TAB_MARKER", raising=False)
+    d = _daemon()
+
+    async def go():
+        await d.handle(cmd("a"))
+        d._record_event("Page.loadEventFired", {}, d.owners["a"].tabs["tab-1"])
+        d._record_event("Page.loadEventFired", {}, "someone-elses-session")
+        await asyncio.sleep(0)
+    asyncio.run(go())
+
+    sid = d.owners["a"].tabs["tab-1"]
+    assert [(p["expression"], s) for m, p, s in d.cdp.calls if m == "Runtime.evaluate"] == [(daemon.TAB_MARKER_JS, sid)] * 2
+
+
+def test_enable_default_domains_runs_four_enables_in_parallel():
+    class _Probe(_Browser):
+        def __init__(self):
+            super().__init__()
+            self.in_flight = self.peak = 0
+            self.release = asyncio.Event()
+
         async def send_raw(self, method, params=None, session_id=None):
-            self.calls.append((method, params, session_id))
-            raise RuntimeError("Session with given id not found")
+            self.in_flight += 1
+            self.peak = max(self.peak, self.in_flight)
+            await self.release.wait()
+            self.in_flight -= 1
+            return {}
 
-    d = daemon.Daemon()
-    d.cdp = _AlwaysStaleCDP()
-    d.session = "current-session"
-
-    result = asyncio.run(d.handle({
-        "method": "Runtime.evaluate",
-        "params": {"expression": "1"},
-        "session_id": "explicit-stale-session",
-    }))
-
-    assert result == {"error": "Session with given id not found"}
-    assert d.cdp.calls == [
-        ("Runtime.evaluate", {"expression": "1"}, "explicit-stale-session")
-    ]
-
-
-class _StaleCDP(_AttachCDP):
-    async def send_raw(self, method, params=None, session_id=None):
-        if session_id == "stale-session":
-            self.calls.append((method, params, session_id))
-            raise RuntimeError("Session with given id not found")
-        return await super().send_raw(method, params, session_id)
+    async def go():
+        d = daemon.Daemon()
+        d.cdp = _Probe()
+        task = asyncio.create_task(d._enable_default_domains("s"))
+        for _ in range(50):
+            await asyncio.sleep(0)
+        d.cdp.release.set()
+        await task
+        return d.cdp.peak
+    assert asyncio.run(go()) == 4
 
 
-def test_stale_session_never_replays_onto_another_tab(monkeypatch):
-    """S1: the agent's tab is gone; the person's tab must not receive the command."""
-    monkeypatch.setattr(daemon, "NAME", "default")
-    d = daemon.Daemon()
-    d.cdp = _StaleCDP([{"targetId": "person-tab", "url": "https://mail.example/", "type": "page"}])
-    d.session, d.target_id = "stale-session", "agent-tab"
+def test_enable_default_domains_swallows_errors_per_domain():
+    d = _daemon()
+    d.cdp.fail["DOM.enable"] = RuntimeError("simulated DOM failure")
 
-    result = asyncio.run(d.handle({"method": "Input.insertText", "params": {"text": "x"}}))
+    asyncio.run(d._enable_default_domains("s"))
 
-    assert result["error"].startswith("tab-closed:")
-    assert [c for c in d.cdp.calls if c[0] == "Target.attachToTarget"] == []
-    assert [s for m, _p, s in d.cdp.calls if m == "Input.insertText"] == ["stale-session"]
+    assert [m for m, _p, _s in d.cdp.calls] == ["Page.enable", "DOM.enable", "Runtime.enable", "Network.enable"]
 
 
-def test_stale_session_reattaches_the_same_tab_once(monkeypatch):
-    monkeypatch.setattr(daemon, "NAME", "default")
-    d = daemon.Daemon()
-    d.cdp = _StaleCDP([
-        {"targetId": "person-tab", "url": "https://mail.example/", "type": "page"},
-        {"targetId": "agent-tab", "url": "https://shop.example/", "type": "page"},
-    ])
-    d.session, d.target_id = "stale-session", "agent-tab"
+def test_close_inspect_tabs_only_when_the_harness_opened_one(monkeypatch, tmp_path):
+    monkeypatch.setenv("BH_CONFIG_DIR", str(tmp_path))
+    inspect = ("inspect-tab", "chrome://inspect/#remote-debugging")
+    d = _daemon(inspect, PERSON)
+    monkeypatch.setattr(daemon, "harness_opened_inspect", lambda: False)
+    asyncio.run(d._close_inspect_tabs([d.cdp.info(t) for t in list(d.cdp.pages)]))
+    assert d.cdp.sent("Target.closeTarget") == []
 
-    result = asyncio.run(d.handle({"method": "Input.insertText", "params": {"text": "x"}}))
+    monkeypatch.setattr(daemon, "harness_opened_inspect", lambda: True)
+    asyncio.run(d._close_inspect_tabs([d.cdp.info(t) for t in list(d.cdp.pages)]))
+    assert list(d.cdp.pages) == ["person-tab"]
 
-    assert result == {"result": {}}
-    assert [p for m, p, _s in d.cdp.calls if m == "Target.attachToTarget"] == [{"targetId": "agent-tab", "flatten": True}]
-    assert [s for m, _p, s in d.cdp.calls if m == "Input.insertText"] == ["stale-session", "session-for-agent-tab"]
+
+# --- owner state survives a daemon restart ---
+
+def test_owner_tabs_survive_a_daemon_restart():
+    d = _daemon(PERSON)
+    _run(d, cmd("a"), cmd("b"), meta("a", "switch_tab", target_id="person-tab"))
+    d.cdp.pages.pop("tab-3")  # b's tab closed while the daemon was down
+
+    again = daemon.Daemon()
+    again.cdp = d.cdp
+    again._load(set(d.cdp.pages))
+    _run(again, cmd("a"), cmd("b"))
+
+    assert again.owners["a"].current == "person-tab"
+    assert set(again.owners["a"].tabs) == {"tab-1", "person-tab"}
+    assert [d.cdp.tab_of(s) for s in d.cdp.sent("Input.insertText")][-2:] == ["person-tab", "tab-7"]
+
+
+def test_shutdown_closes_no_tabs(monkeypatch):
+    monkeypatch.setattr(daemon, "stop_remote", lambda strict=False: True)
+    d = _daemon()
+    d.stop = asyncio.Event()
+    _run(d, cmd("a"))
+
+    [r] = _run(d, {"meta": "shutdown"})
+
+    assert r == {"ok": True} and d.stop.is_set()
+    assert d.cdp.sent("Target.closeTarget") == []
+    assert json.loads(daemon.STATE.read_text())["a"]["tabs"] == ["tab-1"]

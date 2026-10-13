@@ -424,91 +424,94 @@ def test_wait_for_network_idle_filters_events_to_active_session():
     )
 
 
-@pytest.mark.parametrize("value", ["0", "false", "NO", "off"])
-def test_mark_tab_can_be_disabled(monkeypatch, value):
-    calls = []
-    monkeypatch.setenv("BH_TAB_MARKER", value)
-    monkeypatch.setattr(
-        helpers,
-        "cdp",
-        lambda method, **kwargs: calls.append((method, kwargs)),
-    )
-
-    helpers._mark_tab()
-
-    assert calls == []
+def _daemon_replies(monkeypatch, reply):
+    sent = []
+    monkeypatch.setattr(helpers, "_send", lambda request: sent.append(request) or reply)
+    monkeypatch.setattr(helpers, "goto_url", lambda url: sent.append({"goto_url": url}))
+    return sent
 
 
-def test_switch_tab_keeps_visible_tab_unchanged_by_default(monkeypatch):
-    calls = []
+def test_switch_tab_is_one_daemon_command_that_does_not_activate_by_default(monkeypatch):
+    sent = _daemon_replies(monkeypatch, {"session_id": "session-new"})
 
-    def fake_cdp(method, **kwargs):
-        calls.append((method, kwargs))
-        if method == "Target.attachToTarget":
-            return {"sessionId": "session-new"}
-        return {}
-
-    monkeypatch.setattr(helpers, "cdp", fake_cdp)
-    monkeypatch.setattr(helpers, "_send", lambda request: calls.append(("ipc", request)) or {})
-    monkeypatch.setattr(helpers, "_mark_tab", lambda: None)
-
-    assert helpers.switch_tab({"target_id": "target-new"}) == "session-new"
-    assert not any(method == "Target.activateTarget" for method, _ in calls)
+    assert helpers.switch_tab("target-new") == "session-new"
+    assert sent == [{"meta": "switch_tab", "target_id": "target-new", "activate": False}]
 
 
-def test_switch_tab_can_explicitly_activate_visible_tab(monkeypatch):
-    calls = []
+def test_switch_tab_activates_when_asked_and_checks_a_tab_dicts_url(monkeypatch):
+    sent = _daemon_replies(monkeypatch, {"session_id": "session-new"})
 
-    def fake_cdp(method, **kwargs):
-        calls.append((method, kwargs))
-        if method == "Target.attachToTarget":
-            return {"sessionId": "session-new"}
-        return {}
+    helpers.switch_tab({"target_id": "target-new", "url": "https://a.example/"}, activate=True)
 
-    monkeypatch.setattr(helpers, "cdp", fake_cdp)
-    monkeypatch.setattr(helpers, "_send", lambda request: calls.append(("ipc", request)) or {})
-    monkeypatch.setattr(helpers, "_mark_tab", lambda: None)
-
-    assert helpers.switch_tab("target-new", activate=True) == "session-new"
-    assert ("Target.activateTarget", {"targetId": "target-new"}) in calls
+    assert sent == [{"meta": "switch_tab", "target_id": "target-new", "activate": True, "url": "https://a.example/"}]
 
 
-def test_new_tab_creates_and_attaches_in_background(monkeypatch):
-    calls = []
-
-    def fake_cdp(method, **kwargs):
-        calls.append((method, kwargs))
-        if method == "Target.createTarget":
-            return {"targetId": "target-new"}
-        if method == "Target.attachToTarget":
-            return {"sessionId": "session-new"}
-        return {}
-
-    monkeypatch.setattr(helpers, "cdp", fake_cdp)
-    monkeypatch.setattr(helpers, "_send", lambda request: calls.append(("ipc", request)) or {})
-    monkeypatch.setattr(helpers, "_mark_tab", lambda: None)
+def test_new_tab_reuses_an_empty_tab_only_for_a_url(monkeypatch):
+    sent = _daemon_replies(monkeypatch, {"target_id": "target-new"})
 
     assert helpers.new_tab() == "target-new"
-    assert ("Target.createTarget", {"url": "about:blank", "background": True}) in calls
-    assert not any(method == "Target.activateTarget" for method, _ in calls)
+    assert helpers.new_tab("https://example.com") == "target-new"
+    assert sent == [
+        {"meta": "new_tab", "reuse": False},
+        {"meta": "new_tab", "reuse": True},
+        {"goto_url": "https://example.com"},
+    ]
 
 
-def test_new_tab_reuses_an_empty_data_document(monkeypatch):
-    calls = []
-    monkeypatch.setattr(
-        helpers,
-        "current_tab",
-        lambda: {"targetId": "target-placeholder", "url": "data:text/html,"},
-    )
-    monkeypatch.setattr(helpers, "goto_url", lambda url: calls.append(("goto_url", url)))
-    monkeypatch.setattr(
-        helpers,
-        "cdp",
-        lambda method, **kwargs: calls.append((method, kwargs)) or {},
-    )
+def test_list_tabs_hides_other_agents_tabs(monkeypatch):
+    _daemon_replies(monkeypatch, {"tabs": [
+        {"targetId": "mine", "title": "Mine", "url": "https://a.example/", "owner": "you"},
+        {"targetId": "theirs", "title": "Secret", "url": "https://b.example/", "owner": "taken"},
+        {"targetId": "persons", "title": "Mail", "url": "chrome://settings", "owner": None},
+    ]})
 
-    assert helpers.new_tab("https://example.com") == "target-placeholder"
-    assert calls == [("goto_url", "https://example.com")]
+    assert helpers.list_tabs(include_chrome=False) == [
+        {"targetId": "mine", "target_id": "mine", "owner": "you", "title": "Mine", "url": "https://a.example/"},
+        {"targetId": "theirs", "target_id": "theirs", "owner": "taken"},
+    ]
+
+
+def test_send_carries_the_owner(monkeypatch):
+    seen = []
+    monkeypatch.setattr(helpers, "OWNER", "agent-7")
+    with patch("browser_harness.helpers.ipc.connect", return_value=(type("S", (), {"settimeout": lambda s, t: None, "close": lambda s: None})(), None)), \
+         patch("browser_harness.helpers.ipc.request", side_effect=lambda c, t, req: seen.append(req) or {}):
+        helpers._send({"meta": "tabs"})
+
+    assert seen == [{"meta": "tabs", "owner": "agent-7"}]
+
+
+@pytest.mark.parametrize(("env", "owner"), [
+    ({"BH_OWNER": "b", "CLAUDE_CODE_SESSION_ID": "s", "CODEX_THREAD_ID": "t"}, "b"),
+    ({"CLAUDE_CODE_SESSION_ID": "s", "CODEX_THREAD_ID": "t"}, "s"),
+    ({"CODEX_THREAD_ID": "t"}, "t"),
+    ({}, "default"),
+])
+def test_owner_key_order(monkeypatch, env, owner):
+    import importlib
+    for k in ("BH_OWNER", "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID"):
+        monkeypatch.delenv(k, raising=False)
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
+    try:
+        assert importlib.reload(helpers).OWNER == owner
+    finally:
+        monkeypatch.undo()
+        importlib.reload(helpers)
+
+
+def test_sub_agent_without_bh_owner_is_warned_once(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(helpers.ipc, "_RUNTIME", tmp_path)
+    monkeypatch.setattr(helpers, "OWNER", "parent-session")
+    monkeypatch.delenv("BH_OWNER", raising=False)
+    monkeypatch.setenv("CLAUDE_CODE_CHILD_SESSION", "1")
+
+    helpers._warn_shared_owner()
+    helpers._warn_shared_owner()
+    monkeypatch.setenv("BH_OWNER", "child")
+    helpers._warn_shared_owner()
+
+    assert capsys.readouterr().err.count("sub-agent without BH_OWNER") == 1
 
 
 # --- press_key physical key identity (#685) ---

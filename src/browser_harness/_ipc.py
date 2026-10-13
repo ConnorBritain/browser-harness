@@ -52,6 +52,16 @@ def log_path(name):   return _TMP / f"{_tmp_stem(name)}.log"
 def pid_path(name):   return _RUNTIME / f"{_runtime_stem(name)}.pid"
 def port_path(name):  return _RUNTIME / f"{_runtime_stem(name)}.port"  # Windows-only: holds {"port","token"} JSON
 def _sock_path(name): return _RUNTIME / f"{_runtime_stem(name)}.sock"
+def state_path(name): return _RUNTIME / f"{_runtime_stem(name)}.owners.json"
+
+
+def endpoint_label(env=os.environ):
+    """Which browser an env points at: "local" or the CDP host:port, never credentials."""
+    url = env.get("BU_CDP_WS") or env.get("BU_CDP_URL")
+    if not url: return "local"
+    from urllib.parse import urlparse
+    p = urlparse(url)
+    return f"{p.hostname}:{p.port or ''}"
 
 
 def _read_port_file(name):
