@@ -13,6 +13,7 @@ local daemon for isolation: it adds another Allow prompt and isolates nothing mo
 Timers, in seconds, set in the daemon's environment:
 
 - `BH_OWNER_IDLE` (1800): after this long without a command, an agent's tabs other than its current one are given back (left open; unmarked ones get a clean title), and its current tab can be taken by another agent.
+- `BH_OWNER_FORGET` (86400): after this long idle, the agent's current tab is given back too (detached, clean title, left open).
 - `BH_CLOSE_IDLE_TABS=1`: also close the unmarked tabs the idle agent opened itself. Off by default.
 - `BH_IDLE_EXIT` (1800): an unused named local daemon exits. A `BU_CDP_URL`/`BU_CDP_WS` daemon exits on idle only when this is set for it. The default local daemon, Cloud daemons, and daemons used with `BH_REQUIRE_EXISTING_DAEMON=1` never exit on idle.
 

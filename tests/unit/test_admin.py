@@ -164,7 +164,7 @@ def test_update_banner_remains_enabled_by_default(monkeypatch):
 
 
 def test_health_probes_carry_the_callers_owner(monkeypatch):
-    """Review S4: an ownerless probe landed on owner "default" and kept it active forever."""
+    """An ownerless probe landed on owner "default" and kept it active forever."""
     seen = []
     monkeypatch.setenv("BH_OWNER", "agent-7")
     monkeypatch.setattr(admin, "daemon_alive", lambda _name=None: True)
@@ -219,10 +219,10 @@ def test_daemon_must_drive_the_browser_the_env_points_at(monkeypatch, have, mism
     ({"pong": True, "browser_kind": "local"}, "restarted"),  # protocol 1 local daemon, nobody else on it
     ({"pong": True, "protocol": 1, "active": 2, "browser_kind": "local"}, "other agents are using it"),
     ({"pong": True, "protocol": 1, "active": 0, "browser_kind": "cloud"}, "its Cloud browser would stop"),
-    # S5b: restarted from this shell, a CDP daemon would come back on the person's local Chrome
+    # restarted from this shell, a CDP daemon would come back on the person's local Chrome
     ({"pong": True, "protocol": 1, "active": 0, "browser_kind": "cdp"}, "only its starter knows which browser it drives"),
     ({"pong": True, "protocol": 1, "active": 0}, "only its starter knows which browser it drives"),
-    # S5a: an older client never stops a newer daemon; two installs would flap it, one Allow each time
+    # an older client never stops a newer daemon; two installs would flap it, one Allow each time
     ({"pong": True, "protocol": admin.ipc.PROTOCOL + 1, "active": 0, "browser_kind": "local"}, "it is newer than this client"),
 ])
 def test_only_an_idle_daemon_on_another_protocol_restarts(monkeypatch, ping, outcome):

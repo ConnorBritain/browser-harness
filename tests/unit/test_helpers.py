@@ -519,7 +519,7 @@ def test_iframe_target_is_a_daemon_command(monkeypatch):
 
 
 def test_use_browser_says_it_lasts_one_call():
-    """Review S6: the next CLI call is back on BU_NAME; the docs must not promise more."""
+    """The next CLI call is back on BU_NAME; the docs must not promise more."""
     from pathlib import Path
     skill = (Path(helpers.__file__).parent / "SKILL.md").read_text(encoding="utf-8")
     assert "BU_NAME=<name>" in helpers.use_browser.__doc__ and "does not last" in helpers.use_browser.__doc__
@@ -586,7 +586,7 @@ def test_a_sub_agent_without_bh_owner_cannot_close_or_release_its_parents_tabs(m
 
 
 def test_every_sub_agent_call_without_bh_owner_is_warned(monkeypatch, capsys):
-    """Review S3: sub-agents share the parent's session id, so a once-per-id flag warned only one of them."""
+    """Sub-agents share the parent's session id, so a once-per-id flag warned only one of them."""
     monkeypatch.delenv("BH_OWNER", raising=False)
     monkeypatch.setenv("CLAUDE_CODE_CHILD_SESSION", "1")
 

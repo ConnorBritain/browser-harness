@@ -97,7 +97,7 @@ def test_frame_error_stays_useful_for_a_message_less_exception(tmp_path, monkeyp
 
 
 def test_each_owner_has_its_own_active_recording(tmp_path, monkeypatch):
-    """Review S9: agents sharing the default daemon recorded into each other's recording."""
+    """Agents sharing the default daemon recorded into each other's recording."""
     monkeypatch.setattr(recorder, "_recordings_root", lambda: tmp_path)
     monkeypatch.delenv("BU_NAME", raising=False)
     markers = {}

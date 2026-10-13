@@ -12,7 +12,7 @@ switch_tab(tabs[0])                   # take a tab (fails: tab-taken, tab-change
 activate_tab(tid)                     # optional: explicitly show it in Chrome
 mark_tab(tid, "deliverable")          # keep it open for the person when you finish
 close_tab(tid)                        # only your own tabs
-release_tabs()                        # done: close unmarked tabs you opened, give back the rest
+release_tabs()                        # whole task finished, nothing pending: close unmarked tabs you opened, give back the rest
 print(current_tab())
 print(page_info())
 ```

@@ -352,7 +352,7 @@ def test_raw_attach_session_belongs_to_its_owner():
 
 
 def test_another_agents_tab_shows_no_url_or_title_even_to_raw_cdp():
-    """Review S7: hiding was client-side only."""
+    """Hiding was client-side only."""
     d = _daemon(PERSON)
     _run(d, cmd("a"), cmd("b"))
     d.cdp.pages["tab-3"] = "https://secret.example/token=abc"
@@ -408,7 +408,7 @@ def test_an_iframe_is_reachable_only_from_a_tab_known_to_contain_it():
 
 
 def test_raw_attach_to_a_free_tab_takes_it():
-    """Review S7: A raw-attached the person's tab, B took it with switch_tab, A kept driving it."""
+    """A raw-attached the person's tab, B took it with switch_tab, A kept driving it."""
     d = _daemon(PERSON, ("frame", "https://ads.example/"))
     d.info["frame"]["type"] = "iframe"
 
@@ -817,7 +817,7 @@ def test_idle_release_closes_opened_tabs_only_when_asked(monkeypatch):
 
 
 def test_an_idle_owners_tab_can_be_taken_and_it_learns_tab_released():
-    """Review S8: a finished agent's marked tab must not stay taken forever."""
+    """A finished agent's marked tab must not stay taken forever."""
     d = _daemon(PERSON)
     _run(d, cmd("a"), meta("a", "mark_tab", mark="deliverable"), cmd("b"))
     busy, _ = _run(d, meta("b", "switch_tab", target_id="tab-1"), meta("b", "tabs"))
@@ -954,7 +954,7 @@ def test_a_failed_switch_keeps_the_old_tab_current_and_streaming():
 
 
 def test_after_idle_the_next_command_still_goes_to_the_same_tab():
-    """Review B1: the agent waits 31 min for an approval, then clicks in its form or handoff tab."""
+    """The agent waits 31 min for an approval, then clicks in its form or handoff tab."""
     d = _daemon(PERSON)
     _run(d, cmd("a"), meta("a", "mark_tab", mark="handoff"))
     d.owners["a"].seen = _idle()
@@ -1023,7 +1023,7 @@ def test_sweep_keeps_active_owners_and_forgets_idle_empty_ones():
 
 
 def test_only_the_current_tab_streams_network_events():
-    """Review S10: a chatty background tab must not push the current tab's events out of the ring."""
+    """A chatty background tab must not push the current tab's events out of the ring."""
     d = _daemon(PERSON)
     _run(d, cmd("a"))
     first = d.owners["a"].tabs["tab-1"]
@@ -1149,7 +1149,7 @@ def test_a_daemon_started_under_require_existing_never_idle_exits(monkeypatch):
 
 
 def test_idle_exit_releases_tabs_before_it_stops(monkeypatch):
-    """Review B2: stop was set first, so serve() cancelled the release at its first await."""
+    """Stop was set first, so serve() cancelled the release at its first await."""
     monkeypatch.setattr(daemon, "NAME", "work")
     monkeypatch.setattr(daemon, "log", lambda _m: None)
     monkeypatch.setattr(daemon.ipc, "cleanup_endpoint", lambda _n: None)
