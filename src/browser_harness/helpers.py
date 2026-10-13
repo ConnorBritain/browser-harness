@@ -83,10 +83,21 @@ def cdp(method, session_id=None, _response_timeout=DEFAULT_IPC_RESPONSE_TIMEOUT_
 def drain_events():  return _send({"meta": "drain_events"})["events"]
 
 
+def _shares_parents_owner():
+    """A sub-agent inherits its parent's session id, so without BH_OWNER it is its parent's owner."""
+    return not os.environ.get("BH_OWNER") and os.environ.get("CLAUDE_CODE_CHILD_SESSION") == "1"
+
+
+def _refuse_for_shared_owner(what):
+    if _shares_parents_owner():
+        raise RuntimeError(f"owner-shared: {what} refused, because a sub-agent without BH_OWNER would act on its "
+                           "parent's tabs. Nothing was sent. Set BH_OWNER=<name> for this agent and retry.")
+
+
 def _warn_shared_owner():
     """A sub-agent inherits its parent's session id, so without BH_OWNER it drives its parent's
     tabs. Said on every call: siblings share the id, so "once" would reach only one of them."""
-    if not os.environ.get("BH_OWNER") and os.environ.get("CLAUDE_CODE_CHILD_SESSION") == "1":
+    if _shares_parents_owner():
         print("browser-harness: sub-agent without BH_OWNER shares its parent's tabs; prefix commands with BH_OWNER=<name>", file=sys.stderr)
 
 
@@ -389,7 +400,9 @@ def list_tabs(include_chrome=True):
 
 def release_tabs():
     """Call when your task is done: closes the unmarked tabs you opened, gives back the
-    tabs you took from the person, and leaves marked tabs open for them."""
+    tabs you took from the person, and leaves marked tabs open for them. Only when the
+    whole task is finished and no follow-up or approval is pending."""
+    _refuse_for_shared_owner("release_tabs")
     _send({"meta": "release_tabs"})
 
 def list_browsers():
@@ -466,6 +479,7 @@ def new_tab(url="about:blank"):
 
 def close_tab(target=None):
     """Close one of your tabs, the current one by default. Accepts a target id or a tab dict."""
+    _refuse_for_shared_owner("close_tab")
     return _send({"meta": "close_tab", "target_id": _target_id(target)})["closed"]
 
 

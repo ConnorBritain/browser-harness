@@ -576,6 +576,23 @@ def test_owner_key_order(monkeypatch, env, owner):
         importlib.reload(helpers)
 
 
+def test_a_sub_agent_without_bh_owner_cannot_close_or_release_its_parents_tabs(monkeypatch):
+    """It shares the parent's owner, so "I am done" would close the tab the parent is working in."""
+    sent = _daemon_replies(monkeypatch, {"closed": "t1"})
+    monkeypatch.delenv("BH_OWNER", raising=False)
+    monkeypatch.setenv("CLAUDE_CODE_CHILD_SESSION", "1")
+
+    for call in (helpers.release_tabs, helpers.close_tab):
+        with pytest.raises(RuntimeError, match="owner-shared: .* refused.* Nothing was sent. Set BH_OWNER=<name>"):
+            call()
+    assert sent == []
+
+    monkeypatch.setenv("BH_OWNER", "child")
+    helpers.close_tab()
+    helpers.release_tabs()
+    assert sent == [{"meta": "close_tab", "target_id": None}, {"meta": "release_tabs"}]
+
+
 def test_every_sub_agent_call_without_bh_owner_is_warned(monkeypatch, capsys):
     """Review S3: sub-agents share the parent's session id, so a once-per-id flag warned only one of them."""
     monkeypatch.delenv("BH_OWNER", raising=False)
