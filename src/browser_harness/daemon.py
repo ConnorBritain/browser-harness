@@ -128,8 +128,14 @@ LOCAL_HANDSHAKE_TIMEOUT = None
 NO_TOGGLE_GRACE = 3
 TOGGLE_BOOT_GRACE = 12
 OWNER_IDLE = float(os.environ.get("BH_OWNER_IDLE", 1800))  # seconds before an idle owner's tabs are released
+OWNER_FORGET = float(os.environ.get("BH_OWNER_FORGET", 86400))  # seconds before an idle owner's last tab is given back too
 IDLE_EXIT = float(os.environ.get("BH_IDLE_EXIT", 1800))  # seconds before an unused named local daemon exits (CDP: only if set)
-SWEEP_EVERY = min(60, OWNER_IDLE, IDLE_EXIT)
+SWEEP_EVERY = min(60, OWNER_IDLE, OWNER_FORGET, IDLE_EXIT)
+GONE = {  # why an owner lost a tab -> (typed error, what happened)
+    "closed": ("tab-closed", "was closed"),
+    "taken": ("tab-released", "was taken by another agent while you were idle"),
+    "idle": ("tab-released", "was given back while you were idle; it is still open and switch_tab(tab) takes it again"),
+}
 MARKS = {"deliverable": "\U0001F4CC", "handoff": "✋"}  # pin: stays for the person; raised hand: person acts now
 
 
@@ -432,7 +438,8 @@ class Owner:
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     name: str | None = None  # from name_session(), shown in the owner's tab titles
     marks: dict = field(default_factory=dict)  # target_id -> "deliverable" | "handoff"
-    created: set = field(default_factory=set)  # tabs this owner opened; unmarked ones close when it goes idle
+    created: set = field(default_factory=set)  # tabs this owner opened; release_tabs() closes the unmarked ones
+    released: set = field(default_factory=set)  # tabs given back while it was idle, to explain them when it returns
 
 
 class Daemon:
@@ -496,36 +503,47 @@ class Daemon:
         except Exception:
             return None
 
-    def _take(self, key, tid, **how):
-        if self.tab_owner.get(tid, key) != key:
-            self._drop(tid, taken=True)  # its owner went idle; it learns this on its next command
+    async def _take(self, key, tid, **how):
+        """Own a free tab. If an idle owner still held it, that owner learns it on its next
+        command and its session on the tab is detached, so it cannot keep driving the tab."""
+        old = self.tab_owner.get(tid, key)
+        sid = self.owners[old].tabs.get(tid) if old != key else None
+        if old != key:
+            self._drop(tid, "taken")
         self._own(key, tid, **how)
+        if sid:
+            await _silent(self.cdp.send_raw("Target.detachFromTarget", {"sessionId": sid}))
 
     def _taken(self, o, tid, what="tab"):
         return {"error": f"tab-taken: {what} {tid} is driven by another agent. Nothing was sent. {self._yours(o)}"}
 
-    def _closed(self, o, tid, taken=False):
+    def _closed(self, o, tid, why="closed"):
         url = self.info.get(tid, {}).get("url", "")
-        kind, what = ("tab-released", "was taken by another agent while you were idle") if taken else ("tab-closed", "was closed")
+        kind, what = GONE[why]
         return f"{kind}: your tab {tid}{' ' + url if url else ''} {what}. Nothing was sent. {self._yours(o)} Call new_tab(url) or switch_tab(tab)."
 
     def _mine(self, key, o, tid):
         """None when the owner holds tid, else the error to return."""
         if self.tab_owner.get(tid) == key:
             return None
-        return self._taken(o, tid) if self._holder(tid) else {"error": f"tab {tid} is not yours; switch_tab() to it first"}
+        if self._holder(tid):
+            return self._taken(o, tid)
+        if tid in o.released:
+            return {"error": self._closed(o, tid, "idle")}
+        return {"error": f"tab {tid} is not yours; switch_tab() to it first"}
 
     def _own(self, key, tid, current=True, created=False):
         o = self.owners[key]
         self.tab_owner[tid] = key
         o.tabs.setdefault(tid, None)
+        o.released.discard(tid)
         if created:
             o.created.add(tid)
         if current:
             o.current = tid
         self._save()
 
-    def _drop(self, tid, taken=False):
+    def _drop(self, tid, why="closed"):
         """Forget a tab. If it was the owner's current tab, its next command learns it once."""
         key = self.tab_owner.pop(tid, None)
         if key is None:
@@ -538,7 +556,7 @@ class Daemon:
         o.marks.pop(tid, None)
         o.created.discard(tid)
         if o.current == tid:
-            o.current, o.gone = None, self._closed(o, tid, taken)
+            o.current, o.gone = None, self._closed(o, tid, why)
         self._save()
 
     def _save(self):
@@ -599,15 +617,23 @@ class Daemon:
                 raise RuntimeError(self._closed(o, tid))
             return sid  # never None: a command without a session would run at browser level
 
-    async def _focus(self, o, tid):
-        """Make tid the owner's current tab. Only the current tab streams Network events, so a
-        busy background tab cannot push the current tab's events out of the owner's ring."""
-        old, o.current = o.current, tid
-        if old != tid:
-            await asyncio.gather(*(
-                _silent(asyncio.wait_for(self.cdp.send_raw(f"Network.{verb}", session_id=sid), timeout=2))
-                for verb, sid in (("disable", o.tabs.get(old)), ("enable", o.tabs.get(tid))) if sid))
+    async def _switch(self, key, o, tid):
+        """Attach tid if needed and make it the owner's current tab, in one round of calls.
+        Only the current tab streams Network events, so a busy background tab cannot push the
+        current tab's events out of the owner's ring. The current tab moves only on success."""
+        old = o.tabs.get(o.current) if o.current != tid else None
+
+        async def network(verb, sid):
+            if sid:
+                await _silent(asyncio.wait_for(self.cdp.send_raw(f"Network.{verb}", session_id=sid), timeout=2))
+        sid, *_ = await asyncio.gather(self._session(key, o, tid), network("disable", old),
+                                       network("enable", old and o.tabs.get(tid)), return_exceptions=True)
+        if isinstance(sid, BaseException):
+            await network("enable", old)
+            raise sid
+        o.current = tid
         self._save()
+        return sid
 
     def _mark(self, key, tid, prefix=None):
         """Show in the tab title which agent holds it and its mark, off the synchronous IPC path."""
@@ -623,42 +649,51 @@ class Daemon:
             timeout=2,
         )))
 
-    async def _release(self, key, o, done=False):
-        """The owner went idle: its current tab is left alone, its other tabs are given back,
-        detached and left open, unmarked ones with a clean title. An owner that says it is
-        done (release_tabs), or BH_CLOSE_IDLE_TABS=1, also closes the unmarked tabs it opened
-        itself, never the browser's last real page. Done gives back the current tab too."""
-        close = done or os.environ.get("BH_CLOSE_IDLE_TABS") == "1"
+    async def _release(self, key, o, how="idle"):
+        """idle (OWNER_IDLE): the owner's current tab is left alone; its other tabs are given
+        back, detached and left open, unmarked ones with a clean title.
+        forget (OWNER_FORGET): the current tab is given back the same way.
+        done (release_tabs): everything is given back, and the unmarked tabs the owner opened
+        itself are closed, never the browser's last real page. BH_CLOSE_IDLE_TABS=1 closes
+        those on idle too, except the current tab."""
         for tid, sid in list(o.tabs.items()):
-            if tid == o.current and not done:
+            if tid == o.current and how == "idle":
                 continue
+            close = how == "done" or (os.environ.get("BH_CLOSE_IDLE_TABS") == "1" and tid != o.current)
             last = sum(i.get("type") == "page" and is_real_page(i) for i in self.info.values()) <= 1
-            if close and tid in o.created and tid not in o.marks and not last:
+            closed = close and tid in o.created and tid not in o.marks and not last
+            if closed:
                 await _silent(self.cdp.send_raw("Target.closeTarget", {"targetId": tid}))
                 self.info.pop(tid, None)
             elif sid:
                 if tid not in o.marks and (task := self._mark(key, tid, prefix="")):
                     await task  # a marked tab keeps its title for the person
                 await _silent(self.cdp.send_raw("Target.detachFromTarget", {"sessionId": sid}))
-            self._drop(tid)
-        if done:
+            self._drop(tid, "idle")
+            if not closed and how != "done":
+                o.released.add(tid)
+        if how == "done":
             o.gone = None  # it gave its current tab back itself
 
     async def sweep(self):
-        """Release owners idle longer than OWNER_IDLE; forget idle owners with no tabs.
+        """Release owners idle longer than OWNER_IDLE, and their last tab after OWNER_FORGET;
+        forget idle owners that hold nothing.
         Then an unused named local daemon exits after IDLE_EXIT without requests; a CDP daemon
         only if BH_IDLE_EXIT is set for it (its starter may come back hours later). Never the
         default local one (Chrome would ask to Allow again), never a Cloud one (exit stops
         the browser), never one a client requires to exist."""
         for key, o in list(self.owners.items()):
-            if time.time() - o.seen <= OWNER_IDLE:
+            idle = time.time() - o.seen
+            if idle <= OWNER_IDLE:
                 continue
             if not o.tabs:
-                del self.owners[key]
+                if not o.gone or idle > 2 * OWNER_FORGET:  # keep what a late returner must be told
+                    del self.owners[key]
                 continue
             async with o.lock:  # never under a command that is attaching or opening a tab
-                if time.time() - o.seen > OWNER_IDLE:  # the owner may have come back meanwhile
-                    await self._release(key, o)
+                idle = time.time() - o.seen  # the owner may have come back meanwhile
+                if idle > OWNER_IDLE:
+                    await self._release(key, o, "forget" if idle > OWNER_FORGET else "idle")
         may_exit = (BROWSER_KIND == "local" and NAME != "default") or (BROWSER_KIND == "cdp" and "BH_IDLE_EXIT" in os.environ)
         if may_exit and not self.keep and time.time() - self.last > IDLE_EXIT:
             log(f"idle for {IDLE_EXIT:g}s, exiting")
@@ -831,7 +866,7 @@ class Daemon:
             return {"target_id": None}
         if meta == "release_tabs":
             async with o.lock:
-                await self._release(key, o, done=True)
+                await self._release(key, o, "done")
             return {"released": True}
         if meta == "name_session":
             o.name = re.sub(r"\s+", "-", str(req.get("name") or "").strip())[:16] or None
@@ -880,9 +915,8 @@ class Daemon:
             if req.get("url") and info.get("url") != req["url"] and self.tab_owner.get(tid) != key:
                 return {"error": f"tab-changed: tab {tid} now shows {info.get('url')}, not {req['url']}. Nothing was sent. Call list_tabs() and pick again."}
             o.gone = None
-            self._take(key, tid, current=False)
-            sid = await self._session(key, o, tid)  # the current tab moves only once the new one is attached
-            await self._focus(o, tid)
+            await self._take(key, tid, current=False)
+            sid = await self._switch(key, o, tid)
             if req.get("activate"):
                 await self.cdp.send_raw("Target.activateTarget", {"targetId": tid})
             return {"target_id": tid, "session_id": sid}
@@ -892,9 +926,7 @@ class Daemon:
             tid = o.current if reuse else (await self.cdp.send_raw(
                 "Target.createTarget", {"url": "about:blank", "background": True}))["targetId"]
             self._own(key, tid, current=False, created=not reuse)
-            sid = await self._session(key, o, tid)
-            await self._focus(o, tid)
-            return {"target_id": tid, "session_id": sid}
+            return {"target_id": tid, "session_id": await self._switch(key, o, tid)}
         if meta not in ("session", "current_tab"):
             return {"error": f"unknown request {meta!r}: this daemon speaks protocol {ipc.PROTOCOL}; update browser-harness"}
         if o.gone:
@@ -919,7 +951,7 @@ class Daemon:
             if method == "Target.attachToTarget":
                 self.session_owner.setdefault(result["sessionId"], key)
                 if self.info.get(params.get("targetId"), {}).get("type") == "page":
-                    self._take(key, params["targetId"], current=False)  # a raw attach takes the tab like switch_tab
+                    await self._take(key, params["targetId"], current=False)  # a raw attach takes the tab like switch_tab
             elif method == "Target.getTargets":
                 result = {**result, "targetInfos": [self._visible(key, t) for t in result.get("targetInfos", [])]}
             elif method == "Target.getTargetInfo":

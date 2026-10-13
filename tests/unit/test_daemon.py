@@ -114,6 +114,8 @@ class _Browser:
             return {"sessionId": f"s{self.n}-{tid}"}
         if method == "Target.closeTarget":
             self.pages.pop(tid, None)
+        if method == "Target.detachFromTarget":
+            self.stale.add(params["sessionId"])
         return {}
 
     def sent(self, method):
@@ -134,6 +136,11 @@ def _run(d, *reqs):
     async def go():
         return [await d.handle(r) for r in reqs]
     return asyncio.run(go())
+
+
+def _idle():
+    """A last-seen time just past OWNER_IDLE: idle, but far from OWNER_FORGET."""
+    return time.time() - daemon.OWNER_IDLE - 1
 
 
 def cmd(owner, method="Input.insertText", **params):
@@ -579,7 +586,7 @@ def test_event_errors_never_reach_the_websocket_reader(monkeypatch):
     d = _daemon(("frame", "https://ads.example/"))
     d.info["frame"]["type"] = "worker"
     r, _ = _run(d, cmd("a", "Target.attachToTarget", targetId="frame", flatten=True), cmd("b"))
-    d.owners["a"].seen = 0
+    d.owners["a"].seen = _idle()
     asyncio.run(d.sweep())  # a is idle and holds nothing: forgotten, but its raw session lives on
 
     d._record_event("Runtime.consoleAPICalled", {}, r["result"]["sessionId"])
@@ -775,7 +782,7 @@ def _idle_owner_with_five_tabs(monkeypatch):
     _run(d, cmd("a"), meta("a", "new_tab"), meta("a", "mark_tab", mark="deliverable"),
          meta("a", "switch_tab", target_id="person-2"), meta("a", "mark_tab", mark="handoff"),
          meta("a", "switch_tab", target_id="person-tab"), meta("a", "new_tab"))
-    d.owners["a"].seen = 0
+    d.owners["a"].seen = _idle()
     d.cdp.calls.clear()
     return d  # tab-1 opened, tab-3 deliverable, person-2 handoff, person-tab taken, tab-7 current
 
@@ -814,7 +821,7 @@ def test_an_idle_owners_tab_can_be_taken_and_it_learns_tab_released():
     d = _daemon(PERSON)
     _run(d, cmd("a"), meta("a", "mark_tab", mark="deliverable"), cmd("b"))
     busy, _ = _run(d, meta("b", "switch_tab", target_id="tab-1"), meta("b", "tabs"))
-    d.owners["a"].seen = 0
+    d.owners["a"].seen = _idle()
     asyncio.run(d.sweep())
 
     listed, taken, back, after = _run(d, meta("b", "tabs"), meta("b", "switch_tab", target_id="tab-1"), cmd("a"), cmd("a"))
@@ -849,11 +856,108 @@ def test_close_tab_closes_the_tab_the_agent_opened():
     assert r == {"closed": "tab-1"} and list(d.cdp.pages) == ["person-tab"] and d.tab_owner == {}
 
 
+def test_taking_an_idle_agents_tab_detaches_its_old_session():
+    """Otherwise the idle agent could keep driving the tab through its old session."""
+    d = _daemon()
+    _run(d, cmd("a"), cmd("b"))
+    old = d.owners["a"].tabs["tab-1"]
+    d.owners["a"].seen = _idle()
+
+    took, by_old_session = _run(d, meta("b", "switch_tab", target_id="tab-1"),
+                                {**cmd("a", "Runtime.evaluate", expression="document.cookie"), "session_id": old})
+
+    assert took["target_id"] == "tab-1" and took["session_id"] != old
+    assert [p["sessionId"] for m, p, _s in d.cdp.calls if m == "Target.detachFromTarget"] == [old]
+    assert "Session with given id not found" in by_old_session["error"]
+
+
+def test_a_returning_agent_is_told_which_tabs_were_given_back():
+    """Its released tabs look like the person's in list_tabs; the errors must say what happened."""
+    d = _daemon(PERSON)
+    _run(d, cmd("a"), meta("a", "new_tab"))  # tab-1 in the background, tab-3 current
+    d.owners["a"].seen = _idle()
+    asyncio.run(d.sweep())
+
+    close, mark, persons, again, closed = _run(
+        d, meta("a", "close_tab", target_id="tab-1"), meta("a", "mark_tab", target_id="tab-1", mark="deliverable"),
+        meta("a", "close_tab", target_id="person-tab"), meta("a", "switch_tab", target_id="tab-1"), meta("a", "close_tab", target_id="tab-1"))
+
+    for r in (close, mark):
+        assert r["error"].startswith("tab-released: your tab tab-1 was given back while you were idle; it is still open and switch_tab(tab) takes it again.")
+    assert persons["error"] == "tab person-tab is not yours; switch_tab() to it first"
+    assert again["target_id"] == "tab-1" and closed == {"closed": "tab-1"}
+
+
+def test_after_a_day_idle_the_last_tab_is_given_back_too(monkeypatch):
+    """Otherwise every finished session keeps one attached, horse-titled tab for as long as Chrome runs."""
+    monkeypatch.delenv("BH_TAB_MARKER", raising=False)
+    monkeypatch.delenv("BH_CLOSE_IDLE_TABS", raising=False)
+    d = _daemon(PERSON)
+    _run(d, cmd("a"), cmd("b"), meta("b", "mark_tab", mark="deliverable"))
+    d.owners["a"].seen = d.owners["b"].seen = time.time() - daemon.OWNER_FORGET - 1
+    d.cdp.calls.clear()
+
+    asyncio.run(d.sweep())
+    asyncio.run(d.sweep())
+
+    assert sorted(d.cdp.pages) == ["person-tab", "tab-1", "tab-3"] and d.tab_owner == {}  # nothing closed, nothing held
+    assert sorted(d.cdp.tab_of(p["sessionId"]) for m, p, _s in d.cdp.calls if m == "Target.detachFromTarget") == ["tab-1", "tab-3"]
+    assert _titles(d) == [("", "tab-1")]  # the deliverable keeps its title
+    assert list(d.owners) == ["a", "b"]  # kept, so a late return is told what happened
+
+    back, after = _run(d, cmd("a"), cmd("a"))
+    assert back["error"].startswith("tab-released: your tab tab-1 was given back while you were idle")
+    assert after == {"result": {}} and d.cdp.sent("Target.closeTarget") == []
+
+    d.owners["b"].seen = time.time() - 2 * daemon.OWNER_FORGET - 1
+    asyncio.run(d.sweep())
+    assert list(d.owners) == ["a"]
+
+
+def test_switch_runs_attach_and_the_old_tabs_network_disable_together():
+    """One round of calls, as before owners: the reply must fit the client's 5 s budget on slow links."""
+    d = _daemon(PERSON)
+    _run(d, cmd("a"))
+    old = d.owners["a"].tabs["tab-1"]
+    gate, in_flight, real = asyncio.Event(), [], d.cdp.send_raw
+
+    async def slow(method, params=None, session_id=None):
+        if method in ("Target.attachToTarget", "Network.disable"):
+            in_flight.append(method)
+            await gate.wait()
+        return await real(method, params, session_id)
+    d.cdp.send_raw = slow
+
+    async def go():
+        switching = asyncio.create_task(d.handle(meta("a", "switch_tab", target_id="person-tab")))
+        for _ in range(20):
+            await asyncio.sleep(0)
+        waiting = sorted(in_flight)
+        gate.set()
+        return waiting, await switching
+    waiting, r = asyncio.run(go())
+
+    assert waiting == ["Network.disable", "Target.attachToTarget"] and r["target_id"] == "person-tab"
+    assert ("Network.disable", {}, old) in d.cdp.calls
+
+
+def test_a_failed_switch_keeps_the_old_tab_current_and_streaming():
+    d = _daemon(("popup", "https://login.example/"))
+    _run(d, cmd("a"))
+    old = d.owners["a"].tabs["tab-1"]
+    d.cdp.fail["Target.attachToTarget"] = RuntimeError("simulated attach failure")
+
+    [r] = _run(d, meta("a", "switch_tab", target_id="popup"))
+
+    assert r == {"error": "simulated attach failure"} and d.owners["a"].current == "tab-1"
+    assert [m for m, _p, s in d.cdp.calls if s == old and m.startswith("Network.")][-2:] == ["Network.disable", "Network.enable"]
+
+
 def test_after_idle_the_next_command_still_goes_to_the_same_tab():
     """Review B1: the agent waits 31 min for an approval, then clicks in its form or handoff tab."""
     d = _daemon(PERSON)
     _run(d, cmd("a"), meta("a", "mark_tab", mark="handoff"))
-    d.owners["a"].seen = 0
+    d.owners["a"].seen = _idle()
 
     asyncio.run(d.sweep())
     [r] = _run(d, cmd("a", text="continue"))
@@ -869,7 +973,7 @@ def test_a_popup_from_an_owned_tab_is_never_closed_on_idle(monkeypatch):
     _run(d, cmd("a"), meta("a", "mark_tab", mark="handoff"))
     d.cdp.pages["popup"] = "https://bank.example/"
     d._record_event("Target.targetCreated", {"targetInfo": {"targetId": "popup", "type": "page", "url": "https://bank.example/", "openerId": "tab-1"}})
-    d.owners["a"].seen = 0
+    d.owners["a"].seen = _idle()
 
     asyncio.run(d.sweep())
 
@@ -884,7 +988,7 @@ def test_release_waits_for_the_owners_running_command_and_then_skips():
     async def go():
         o = d.owners["a"]
         await o.lock.acquire()  # a command of the owner is attaching a tab
-        o.seen = 0
+        o.seen = _idle()
         sweep = asyncio.create_task(d.sweep())
         await asyncio.sleep(0.01)
         o.seen = time.time()  # ... and it was a new request
@@ -901,7 +1005,7 @@ def test_idle_release_never_closes_the_browsers_last_real_page(monkeypatch):
     _run(d, cmd("a", "Page.navigate", url="https://shop.example/"), meta("a", "new_tab"))
     d.cdp.pages["tab-1"] = "https://shop.example/"
     d.info = {t: d.cdp.info(t) for t in d.cdp.pages}
-    d.owners["a"].seen = 0
+    d.owners["a"].seen = _idle()
 
     asyncio.run(d.sweep())
 
@@ -911,7 +1015,7 @@ def test_idle_release_never_closes_the_browsers_last_real_page(monkeypatch):
 def test_sweep_keeps_active_owners_and_forgets_idle_empty_ones():
     d = _daemon()
     _run(d, cmd("a"), meta("b", "tabs"))
-    d.owners["b"].seen = 0
+    d.owners["b"].seen = _idle()
 
     asyncio.run(d.sweep())
 
@@ -987,7 +1091,7 @@ def test_close_inspect_tabs_only_when_the_harness_opened_one(monkeypatch, tmp_pa
 def test_ping_reports_protocol_and_other_active_owners():
     d = _daemon()
     _run(d, cmd("a"), cmd("b"), meta("c", "tabs"))
-    d.owners["b"].seen = 0
+    d.owners["b"].seen = _idle()
 
     me, other = _run(d, {"meta": "ping", "owner": "a"}, {"meta": "ping", "owner": "z"})
 
@@ -998,11 +1102,11 @@ def test_ping_reports_protocol_and_other_active_owners():
 def test_another_agents_probe_does_not_keep_the_default_owner_active():
     d = _daemon()
     _run(d, {"method": "Input.insertText", "params": {"text": "x"}})  # a client without owner opened a tab
-    d.owners["default"].seen = 0
+    d.owners["default"].seen = long_ago = _idle()
 
     _, ping = _run(d, {"method": "Target.getTargets", "params": {}, "owner": "agent-7"}, {"meta": "ping", "owner": "agent-7"})
 
-    assert ping["active"] == 0 and d.owners["default"].seen == 0
+    assert ping["active"] == 0 and d.owners["default"].seen == long_ago
 
 
 def test_ping_is_not_activity():
@@ -1067,7 +1171,7 @@ def test_idle_exit_releases_tabs_before_it_stops(monkeypatch):
             return await real(method, params, session_id)
         d.cdp.send_raw = slow
         for o in d.owners.values():
-            o.seen = 0
+            o.seen = _idle()
         d.last = 0
         await asyncio.wait_for(daemon.serve(d), timeout=2)
         return d
