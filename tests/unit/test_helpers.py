@@ -511,6 +511,14 @@ def test_use_browser_routes_the_next_commands(monkeypatch):
     assert seen == ["rig"]
 
 
+def test_use_browser_says_it_lasts_one_call():
+    """Review S6: the next CLI call is back on BU_NAME; the docs must not promise more."""
+    from pathlib import Path
+    skill = (Path(helpers.__file__).parent / "SKILL.md").read_text(encoding="utf-8")
+    assert "BU_NAME=<name>" in helpers.use_browser.__doc__ and "does not last" in helpers.use_browser.__doc__
+    assert "`use_browser(name)` switches for the rest of one call only, so use `BU_NAME=<name>` for later calls" in skill
+
+
 def test_mark_tab_and_name_session_are_daemon_commands(monkeypatch):
     sent = _daemon_replies(monkeypatch, {"mark": "deliverable", "name": "shop"})
 

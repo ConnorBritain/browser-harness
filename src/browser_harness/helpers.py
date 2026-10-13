@@ -394,8 +394,10 @@ def list_browsers():
             for n in _daemon_endpoint_names() if (p := _ping(n)).get("pong")]
 
 def use_browser(name):
-    """Send the next commands to the running browser `name` (see list_browsers()).
-    An unknown name fails with browser-not-found; it never falls back to another browser."""
+    """Send the rest of THIS call's commands to the running browser `name` (see
+    list_browsers()). It does not last: the next `browser-harness` call is back on
+    BU_NAME, so use `BU_NAME=<name> browser-harness` for later calls. An unknown name
+    fails with browser-not-found; it never falls back to another browser."""
     global NAME
     from .admin import _ping
     if not _ping(str(name)).get("pong"):

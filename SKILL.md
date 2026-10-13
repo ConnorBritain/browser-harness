@@ -30,7 +30,7 @@ PY
 - Parallel agents and sub-agents each prefix commands with their own `BH_OWNER=<name>`; the same owner means shared tabs.
 - `mark_tab(tab, "deliverable")` keeps a tab open for the person after you finish; `"handoff"` means the person should act in it now. Unmarked tabs you opened close when you go idle.
 - Everything runs in the background. Call `activate_tab(tab)` only when the user asks to see a tab: it brings Chrome to the front. For a focus-gated page, wrap the step in `cdp("Emulation.setFocusEmulationEnabled", enabled=True)` and disable it in `finally`; if that fails, report it instead of activating.
-- One daemon per browser. Omit `BU_NAME` for the local Chrome and never invent per-job names: each new local daemon makes Chrome ask to Allow again. `list_browsers()` and `use_browser(name)` switch between running browsers.
+- One daemon per browser. Omit `BU_NAME` for the local Chrome and never invent per-job names: each new local daemon makes Chrome ask to Allow again. `list_browsers()` shows the running ones; `use_browser(name)` switches for the rest of one call only, so use `BU_NAME=<name>` for later calls.
 - Titles of your tabs start with 🐴 plus your `name_session("...")` name; `BH_TAB_MARKER=0` leaves titles unchanged.
 
 ## Page Workflow
