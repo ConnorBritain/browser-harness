@@ -494,9 +494,12 @@ class Daemon:
     def _save(self):
         state = {k: {"tabs": list(o.tabs), "current": o.current, "name": o.name, "marks": o.marks,
                      "created": sorted(o.created)} for k, o in self.owners.items() if o.tabs}
-        tmp = STATE.with_name(f"{STATE.name}.tmp")
-        tmp.write_text(json.dumps(state))
-        os.replace(tmp, STATE)
+        try:  # best effort: a full disk must not take the daemon down
+            tmp = STATE.with_name(f"{STATE.name}.tmp")
+            tmp.write_text(json.dumps(state))
+            os.replace(tmp, STATE)
+        except OSError as e:
+            log(f"save owners: {e}")
 
     def _load(self, pages):
         """Owners keep their tabs, names and marks across daemon restarts."""
@@ -622,12 +625,18 @@ class Daemon:
         await asyncio.gather(*(enable_one(d) for d in ("Page", "DOM", "Runtime", "Network")))
 
     def _record_event(self, method, params, session_id=None):
+        try:  # an error here would end the websocket reader and with it the daemon
+            self._route_event(method, params, session_id)
+        except Exception as e:
+            log(f"event {method}: {e!r}")
+
+    def _route_event(self, method, params, session_id=None):
         key = self.session_owner.get(session_id)
         if method == "Target.attachedToTarget" and key:
             self.session_owner[params["sessionId"]] = key  # auto-attached iframes and workers
         if method.startswith("Target.") and not session_id:
             return self._target_event(method, params)
-        if session_id and key is None:
+        if session_id and key not in self.owners:  # unknown session, or its owner was forgotten
             return
         for o in [self.owners[key]] if key else self.owners.values():
             o.events.append({"method": method, "params": params, "session_id": session_id})

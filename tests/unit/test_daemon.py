@@ -449,6 +449,25 @@ def test_connection_status_is_healthy_before_any_tab():
     assert d.cdp.sent("Target.createTarget") == []
 
 
+def test_event_errors_never_reach_the_websocket_reader(monkeypatch):
+    """An exception in the event tap would end the reader and with it the daemon."""
+    logged = []
+    monkeypatch.setattr(daemon, "log", logged.append)
+    d = _daemon(("frame", "https://ads.example/"))
+    r, _ = _run(d, cmd("a", "Target.attachToTarget", targetId="frame", flatten=True), cmd("b"))
+    d.owners["a"].seen = 0
+    asyncio.run(d.sweep())  # a is idle and holds nothing: forgotten, but its raw session lives on
+
+    d._record_event("Runtime.consoleAPICalled", {}, r["result"]["sessionId"])
+    monkeypatch.setattr(daemon, "STATE", daemon.STATE.parent / "missing-dir" / "owners.json")
+    d._record_event("Target.targetDestroyed", {"targetId": "tab-2"})
+    monkeypatch.setattr(d, "_route_event", lambda *a: 1 / 0)
+    d._record_event("Page.loadEventFired", {}, "s")
+
+    assert "a" not in d.owners and d.tab_owner == {}
+    assert [m.split(":")[0] for m in logged] == ["save owners", "event Page.loadEventFired"]
+
+
 # --- stale sessions (S1) ---
 
 def test_stale_session_never_replays_onto_another_tab():
