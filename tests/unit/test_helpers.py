@@ -511,19 +511,11 @@ def test_use_browser_routes_the_next_commands(monkeypatch):
     assert seen == ["rig"]
 
 
-def test_iframe_target_only_looks_inside_your_current_tab(monkeypatch):
-    """Review S7: it used to return the first matching iframe in the whole browser."""
-    targets = [
-        {"targetId": "theirs", "type": "iframe", "url": "https://pay.example/frame", "parentFrameId": "other-tab"},
-        {"targetId": "nested", "type": "iframe", "url": "https://pay.example/frame", "parentFrameId": "outer"},
-        {"targetId": "outer", "type": "iframe", "url": "https://shop.example/widget", "parentFrameId": "local-child"},
-        {"targetId": "other-tab", "type": "page", "url": "https://x.example/"},
-    ]
-    tree = {"frame": {"id": "my-tab"}, "childFrames": [{"frame": {"id": "local-child"}}]}
-    monkeypatch.setattr(helpers, "cdp", lambda method, **kw: {"frameTree": tree} if method == "Page.getFrameTree" else {"targetInfos": targets})
+def test_iframe_target_is_a_daemon_command(monkeypatch):
+    sent = _daemon_replies(monkeypatch, {"target_id": "frame-1"})
 
-    assert helpers.iframe_target("pay.example") == "nested"
-    assert helpers.iframe_target("x.example") is None
+    assert helpers.iframe_target("pay.example") == "frame-1"
+    assert sent == [{"meta": "iframe_target", "url": "pay.example"}]
 
 
 def test_use_browser_says_it_lasts_one_call():

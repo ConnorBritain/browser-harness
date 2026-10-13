@@ -355,8 +355,49 @@ def test_another_agents_tab_shows_no_url_or_title_even_to_raw_cdp():
                                     cmd("a", "Target.getTargetInfo", targetId="tab-3"), cmd("b", "Target.getTargetInfo", targetId="tab-3"))
 
     assert "secret" not in json.dumps([tabs, targets, info]) and "secret" in json.dumps(own)
-    assert {t["targetId"]: t.get("url") for t in tabs["tabs"]} == {"person-tab": "https://mail.example/", "tab-1": "about:blank", "tab-3": None}
-    assert d._visible("a", d.info["frame"]) == {"targetId": "frame", "type": "iframe", "parentFrameId": "tab-3"}
+    assert {t["targetId"]: t["url"] for t in tabs["tabs"]} == {"person-tab": "https://mail.example/", "tab-1": "about:blank", "tab-3": ""}
+    assert [t for t in targets["result"]["targetInfos"] if "example" in t["url"]]  # keys stay, so filters keep working
+    assert d._visible("a", d.info["frame"]) == {"targetId": "frame", "type": "iframe", "url": "", "title": "", "parentFrameId": "tab-3"}
+    assert d._visible("b", d.info["frame"])["url"] == "https://secret.example/pay"
+
+
+def _frames(d, *frames):
+    """Iframe targets as Chrome reports them: (target id, url, parent frame id or None)."""
+    for tid, url, parent in frames:
+        d.cdp.pages[tid] = url  # attachable in the fake browser
+        d.info[tid] = {"targetId": tid, "type": "iframe", "url": url, **({"parentFrameId": parent} if parent else {})}
+
+
+def test_an_iframe_is_reachable_only_from_a_tab_known_to_contain_it():
+    """Its tab must be yours: by Chrome's parent chain, or because your current tab owns the frame."""
+    d = _daemon(PERSON)
+    _run(d, cmd("a"), cmd("b"))  # a: tab-1, b: tab-3
+    _frames(d, ("in-a", "https://pay.example/a", "tab-1"), ("deep-a", "https://pay.example/deep", "in-a"),
+            ("in-b", "https://pay.example/b", "tab-3"), ("in-person", "https://pay.example/p", "person-tab"),
+            ("orphan", "https://pay.example/o", "some-local-frame"), ("no-parent", "https://pay.example/n", None))
+    real = d.cdp.send_raw
+
+    async def frame_owner(method, params=None, session_id=None):
+        if method == "DOM.getFrameOwner":  # only a's current tab has an iframe element owning "no-parent"
+            d.cdp.calls.append((method, params, session_id))
+            if d.cdp.tab_of(session_id) == "tab-1" and params["frameId"] == "no-parent":
+                return {"backendNodeId": 7}
+            raise RuntimeError("Frame with the given id was not found.")
+        return await real(method, params, session_id)
+    d.cdp.send_raw = frame_owner
+    attach = lambda who, tid: cmd(who, "Target.attachToTarget", targetId=tid, flatten=True)
+
+    results = _run(d, *(attach("a", t) for t in ("in-a", "deep-a", "no-parent", "in-b", "in-person", "orphan")), attach("b", "no-parent"))
+    found = _run(d, meta("a", "iframe_target", url="pay.example/deep"), meta("a", "iframe_target", url="pay.example/n"),
+                 meta("a", "iframe_target", url="pay.example/b"), meta("a", "iframe_target", url="pay.example/p"),
+                 meta("b", "iframe_target", url="pay.example/n"), meta("c", "iframe_target", url="pay.example"))
+
+    assert ["sessionId" in r.get("result", {}) for r in results] == [True, True, True, False, False, False, False]
+    assert results[3]["error"].startswith("tab-taken:")
+    assert all(r["error"].startswith("frame-not-yours: iframe") for r in results[4:])
+    assert [r["target_id"] for r in found] == ["deep-a", "no-parent", None, None, None, None]
+    assert {tid: d._visible("a", i)["url"] != "" for tid, i in d.info.items() if i["type"] == "iframe"} == {
+        "in-a": True, "deep-a": True, "in-b": False, "in-person": False, "orphan": False, "no-parent": False}
 
 
 def test_raw_attach_to_a_free_tab_takes_it():
@@ -371,7 +412,7 @@ def test_raw_attach_to_a_free_tab_takes_it():
     assert "sessionId" in attached["result"] and d.tab_owner == {"person-tab": "a"}
     assert d.owners["a"].current is None  # taken, but not made current
     assert b_switch["error"].startswith("tab-taken:") and b_attach["error"].startswith("tab-taken:")
-    assert "sessionId" in b_frame["result"] and "frame" not in d.tab_owner  # a target that is no tab has no owner
+    assert b_frame["error"].startswith("frame-not-yours:") and "frame" not in d.tab_owner  # an iframe is never a tab
 
 
 def test_close_tab_closes_only_your_tabs():
@@ -536,7 +577,7 @@ def test_event_errors_never_reach_the_websocket_reader(monkeypatch):
     logged = []
     monkeypatch.setattr(daemon, "log", logged.append)
     d = _daemon(("frame", "https://ads.example/"))
-    d.info["frame"]["type"] = "iframe"
+    d.info["frame"]["type"] = "worker"
     r, _ = _run(d, cmd("a", "Target.attachToTarget", targetId="frame", flatten=True), cmd("b"))
     d.owners["a"].seen = 0
     asyncio.run(d.sweep())  # a is idle and holds nothing: forgotten, but its raw session lives on

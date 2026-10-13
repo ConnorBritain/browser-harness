@@ -458,22 +458,43 @@ class Daemon:
         tabs = ", ".join(f"{t} {self.info.get(t, {}).get('url', '')}".strip() for t in o.tabs)
         return f"Your tabs: {tabs or 'none'}."
 
-    def _holder(self, tid):
-        """Who holds the tab now; an iframe or worker counts as its tab. A tab whose owner has
-        been idle for OWNER_IDLE is free to take."""
-        for _ in range(16):  # walk up to the page the target lives in
+    def _root(self, tid):
+        """The outermost known frame above a target: its tab when Chrome reports every parent."""
+        for _ in range(16):
             parent = self.info.get(tid, {}).get("parentFrameId")
             if not parent:
                 break
             tid = parent
-        key = self.tab_owner.get(tid)
+        return tid
+
+    def _holder(self, tid):
+        """Who holds the tab now; an iframe or worker counts as its tab. A tab whose owner has
+        been idle for OWNER_IDLE is free to take."""
+        key = self.tab_owner.get(self._root(tid))
         return key if key and time.time() - self.owners[key].seen <= OWNER_IDLE else None
 
     def _visible(self, key, info):
-        """Target info as this owner may see it: another agent's tab shows no url or title."""
-        if self._holder(info.get("targetId")) in (None, key):
-            return info
-        return {k: v for k, v in info.items() if k not in ("url", "title")}
+        """Target info as this owner may see it. Another agent's tab, and any iframe not known
+        to sit in one of this owner's tabs, keeps its keys but shows an empty url and title."""
+        tid = info.get("targetId")
+        if info.get("type") == "iframe":
+            hidden = self.tab_owner.get(self._root(tid)) != key
+        else:
+            hidden = self._holder(tid) not in (None, key)
+        return {**info, "url": "", "title": ""} if hidden else info
+
+    async def _frame_tab(self, key, o, tid):
+        """The tab of this owner that an iframe target sits in, or None when that cannot be shown."""
+        tid = self._root(tid)
+        if tid in self.tab_owner:
+            return tid if self.tab_owner[tid] == key else None
+        # No tab above it is known: its parent is a same-process frame, or Chrome sent no parent.
+        # The owner's current tab can still vouch for a frame that one of its iframe elements owns.
+        sid = o.tabs.get(o.current)
+        try:
+            return o.current if sid and await self.cdp.send_raw("DOM.getFrameOwner", {"frameId": tid}, session_id=sid) else None
+        except Exception:
+            return None
 
     def _take(self, key, tid, **how):
         if self.tab_owner.get(tid, key) != key:
@@ -802,6 +823,12 @@ class Daemon:
             pages = [t for t in (await self.cdp.send_raw("Target.getTargets"))["targetInfos"] if t["type"] == "page"]
             return {"tabs": [{**self._visible(key, t), "owner": "you" if self.tab_owner.get(t["targetId"]) == key else "taken" if self._holder(t["targetId"]) else None,
                               "mark": o.marks.get(t["targetId"])} for t in pages]}
+        if meta == "iframe_target":
+            for tid, info in list(self.info.items()):
+                if info.get("type") == "iframe" and req["url"] in info.get("url", "") \
+                        and o.current and await self._frame_tab(key, o, tid) == o.current:
+                    return {"target_id": tid}
+            return {"target_id": None}
         if meta == "release_tabs":
             async with o.lock:
                 await self._release(key, o, done=True)
@@ -884,6 +911,10 @@ class Daemon:
         if method.startswith("Target."):  # browser-level; never routed through a tab session
             if method in GUARDED and self._holder(params.get("targetId")) not in (None, key):
                 return self._taken(o, params.get("targetId"))
+            if method == "Target.attachToTarget" and self.info.get(params.get("targetId"), {}).get("type") == "iframe" \
+                    and await self._frame_tab(key, o, params["targetId"]) is None:
+                return {"error": f"frame-not-yours: iframe {params['targetId']} is not known to be inside a tab you hold. "
+                                 "Nothing was sent. switch_tab() to its tab, then use iframe_target(url)."}
             result = await self.cdp.send_raw(method, params)
             if method == "Target.attachToTarget":
                 self.session_owner.setdefault(result["sessionId"], key)

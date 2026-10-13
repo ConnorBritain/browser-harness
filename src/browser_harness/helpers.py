@@ -490,18 +490,7 @@ def ensure_real_tab():
 def iframe_target(url_substr):
     """First cross-origin iframe inside your current tab whose URL contains `url_substr`.
     Use with js(..., target_id=...). Never an iframe of another tab."""
-    mine, todo = set(), [cdp("Page.getFrameTree")["frameTree"]]
-    while todo:
-        node = todo.pop()
-        mine.add(node["frame"]["id"])
-        todo += node.get("childFrames", [])
-    frames = [t for t in cdp("Target.getTargets")["targetInfos"] if t["type"] == "iframe"]
-    for _ in frames:  # an iframe target whose parent frame is mine is mine too, however deep
-        mine |= {t["targetId"] for t in frames if t.get("parentFrameId") in mine}
-    for t in frames:
-        if t["targetId"] in mine and url_substr in t.get("url", ""):
-            return t["targetId"]
-    return None
+    return _send({"meta": "iframe_target", "url": url_substr})["target_id"]
 
 
 # --- utility ---
@@ -583,6 +572,8 @@ def wait_for_network_idle(timeout=10.0, idle_ms=500):
 
 def js(expression, target_id=None):
     """Run JS in the attached tab (default) or inside an iframe target (via iframe_target()).
+    A `target_id` that is a free tab takes that tab for you, like switch_tab() without
+    making it current; an iframe must be inside a tab you hold.
 
     Expressions are evaluated as-is first. If Chrome reports an illegal top-level
     `return`, the snippet is retried inside a function wrapper, so both
