@@ -773,7 +773,9 @@ def test_upload_file_sends_bytes_through_the_page_when_the_browser_rejects_the_p
     assert calls[1] == ("DOM.resolveNode", {"backendNodeId": 42})
     method, kwargs = calls[2]
     assert method == "Runtime.callFunctionOn" and kwargs["objectId"] == "obj-1"
-    assert kwargs["arguments"] == [{"value": [["cv.txt", "dGV4dA=="]]}]
+    assert kwargs["arguments"] == [{"value": [["cv.txt", "dGV4dA==", "text/plain"]]}]
+    assert kwargs["_response_timeout"] == helpers.UPLOAD_IPC_RESPONSE_TIMEOUT_SECONDS
+    assert "new File([Uint8Array.from(atob(b),c=>c.charCodeAt(0))],n,{type:t})" in kwargs["functionDeclaration"]
 
 
 def test_upload_file_keeps_other_errors(tmp_path):
