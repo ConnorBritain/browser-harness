@@ -371,22 +371,39 @@ def daemon_alive(name=None):
     return ipc.ping(name or NAME, timeout=1.0)
 
 
+def _ping(name=None):
+    """The live daemon's ping reply, or {} when unreachable."""
+    c = None
+    try:
+        c, token = ipc.connect(name or NAME, timeout=1.0)
+        response = ipc.request(c, token, {"meta": "ping"})
+        return response if isinstance(response, dict) else {}
+    except (FileNotFoundError, ConnectionRefusedError, TimeoutError, socket.timeout, OSError, ValueError):
+        return {}
+    finally:
+        if c:
+            c.close()
+
+
 def daemon_browser_kind(name=None):
     """'cloud' | 'cdp' | 'local' as self-reported by a live daemon, else None.
 
     None covers unreachable daemons and pre-browser_kind daemons still running
     from an older version."""
-    c = None
-    try:
-        c, token = ipc.connect(name or NAME, timeout=1.0)
-        response = ipc.request(c, token, {"meta": "ping"})
-        kind = response.get("browser_kind") if isinstance(response, dict) else None
-        return kind if kind in {"cloud", "cdp", "local"} else None
-    except (FileNotFoundError, ConnectionRefusedError, TimeoutError, socket.timeout, OSError, ValueError):
-        return None
-    finally:
-        if c:
-            c.close()
+    kind = _ping(name).get("browser_kind")
+    return kind if kind in {"cloud", "cdp", "local"} else None
+
+
+def _check_same_browser(name=None):
+    """A daemon reached by name must drive the browser BU_CDP_URL/BU_CDP_WS points at."""
+    if not (os.environ.get("BU_CDP_WS") or os.environ.get("BU_CDP_URL")):
+        return
+    have, want = _ping(name).get("endpoint"), ipc.endpoint_label()
+    if have and have != want:
+        raise RuntimeError(
+            f"browser-mismatch: daemon {name or NAME!r} drives {have}, but BU_CDP_URL/BU_CDP_WS points at {want}. "
+            "Nothing was sent. Use another BU_NAME, or run --reload to reconnect this one."
+        )
 
 
 def _daemon_endpoint_names():
@@ -537,9 +554,10 @@ def ensure_daemon(wait=None, name=None, env=None):
                     resp = ipc.request(s, token, {"method": "Target.getTargets", "params": {}})
                 finally:
                     s.close()
-                if "result" in resp: return
             except Exception:
-                pass
+                resp = {}
+            if isinstance(resp, dict) and "result" in resp:
+                return _check_same_browser(name)
             if not last: time.sleep(0.5)
         browser_kind = daemon_browser_kind(name)
         if browser_kind in {"cloud", None}:
@@ -732,6 +750,7 @@ def require_existing_daemon(name=None):
         raise RuntimeError(f"required daemon {daemon_name!r} is unhealthy: {exc}") from exc
     if not isinstance(resp, dict) or "result" not in resp:
         raise RuntimeError(f"required daemon {daemon_name!r} failed its CDP health check")
+    _check_same_browser(daemon_name)
 
 
 def stop_remote_daemon(name="remote"):

@@ -3,7 +3,7 @@
 Core helpers live here. Agent-editable helpers live in
 BH_AGENT_WORKSPACE/agent_helpers.py.
 """
-import base64, importlib.util, json, math, os, time, urllib.request
+import base64, importlib.util, json, math, os, re, sys, time, urllib.request
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -37,6 +37,9 @@ _load_env()
 
 NAME = os.environ.get("BU_NAME", "default")
 SOCK = ipc.sock_addr(NAME)
+# Which agent is calling. Each owner drives only its own tabs. Sub-agents
+# inherit their parent's session id, so they need their own BH_OWNER.
+OWNER = os.environ.get("BH_OWNER") or os.environ.get("CLAUDE_CODE_SESSION_ID") or os.environ.get("CODEX_THREAD_ID") or "default"
 INTERNAL = ("chrome://", "chrome-untrusted://", "devtools://", "chrome-extension://", "about:")
 IPC_CONNECT_TIMEOUT_SECONDS = 5.0
 DEFAULT_IPC_RESPONSE_TIMEOUT_SECONDS = 5.0
@@ -54,7 +57,7 @@ def _send(req, response_timeout=DEFAULT_IPC_RESPONSE_TIMEOUT_SECONDS):
     try:
         c.settimeout(response_timeout)
         try:
-            r = ipc.request(c, token, req)
+            r = ipc.request(c, token, {**req, "owner": OWNER})
         except TimeoutError as e:
             # Carry the detail on the exception itself. Raising the bare class
             # left str(exc) empty, so every caller that reported the error had
@@ -78,6 +81,16 @@ def cdp(method, session_id=None, _response_timeout=DEFAULT_IPC_RESPONSE_TIMEOUT_
 
 
 def drain_events():  return _send({"meta": "drain_events"})["events"]
+
+
+def _warn_shared_owner():
+    """Once per session: a sub-agent without BH_OWNER would drive its parent's tabs."""
+    if os.environ.get("BH_OWNER") or os.environ.get("CLAUDE_CODE_CHILD_SESSION") != "1":
+        return
+    flag = ipc._RUNTIME / f"warned-{re.sub(r'[^A-Za-z0-9_-]', '_', OWNER)[:64]}"
+    if not flag.exists():
+        flag.touch()
+        print("browser-harness: sub-agent without BH_OWNER shares its parent's tabs; prefix commands with BH_OWNER=<name>", file=sys.stderr)
 
 
 def _js_snippet(expression, limit=160):
@@ -362,21 +375,19 @@ def _is_agent_startup_placeholder(title, url):
 
 
 def list_tabs(include_chrome=True):
+    """Every tab with its owner: "you", None (the person's, free to switch_tab) or
+    "taken" (another agent's, shown without title or url)."""
     out = []
-    for t in cdp("Target.getTargets")["targetInfos"]:
-        if t["type"] != "page": continue
+    for t in _send({"meta": "tabs"})["tabs"]:
         url = t.get("url", "")
         if _is_agent_startup_placeholder(t.get("title", ""), url): continue
         if not include_chrome and url.startswith(INTERNAL): continue
-        out.append({
-            "targetId": t["targetId"],
-            "target_id": t["targetId"],
-            "title": t.get("title", ""),
-            "url": url,
-        })
+        tab = {"targetId": t["targetId"], "target_id": t["targetId"], "owner": t["owner"]}
+        out.append(tab if t["owner"] == "taken" else {**tab, "title": t.get("title", ""), "url": url})
     return out
 
 def current_tab():
+    """Your current tab. A fresh owner gets its own background tab, never the person's."""
     r = _send({"meta": "current_tab"})
     return {
         "targetId": r["targetId"],
@@ -384,13 +395,6 @@ def current_tab():
         "url": r["url"],
         "title": r["title"],
     }
-
-def _mark_tab():
-    """Prepend horse emoji to tab title so the user can see which tab the agent controls."""
-    if os.environ.get("BH_TAB_MARKER", "").strip().lower() in {"0", "false", "no", "off"}:
-        return
-    try: cdp("Runtime.evaluate", expression="if(!document.title.startsWith('\U0001F434'))document.title='\U0001F434 '+document.title")
-    except Exception: pass
 
 def _target_id(target):
     """Accept a raw target id or a tab dict returned by the helpers."""
@@ -407,71 +411,32 @@ def activate_tab(target):
     return target_id
 
 def switch_tab(target, activate=False):
-    """Attach the agent without changing Chrome's visible tab by default.
-
-    Pass activate=True only when Chrome must visibly show the target. The horse
-    marker still moves to the attached target so the user can find it.
-    """
-    # Accept either a raw targetId string or the dict returned by current_tab() / list_tabs(),
-    # so `switch_tab(current_tab())` works without a manual ["targetId"] dance.
-    target_id = _target_id(target)
-    # Unmark old tab. Horse emoji is a surrogate pair in JS UTF-16 strings (2 code units),
-    # plus the trailing space = 3 code units, so slice(3) cleanly removes the prefix.
-    try: cdp("Runtime.evaluate", expression="if(document.title.startsWith('\U0001F434 '))document.title=document.title.slice(3)")
-    except Exception: pass
-    if activate:
-        activate_tab(target_id)
-    sid = cdp("Target.attachToTarget", targetId=target_id, flatten=True)["sessionId"]
-    _send({"meta": "set_session", "session_id": sid, "target_id": target_id})
-    _mark_tab()
-    return sid
+    """Take a tab and make it your current one, without changing Chrome's visible
+    tab unless activate=True. Another agent's tab fails with tab-taken. A dict
+    from list_tabs() also fails with tab-changed if the tab's url moved since."""
+    req = {"meta": "switch_tab", "target_id": _target_id(target), "activate": activate}
+    if isinstance(target, dict) and target.get("url"):
+        req["url"] = target["url"]
+    return _send(req)["session_id"]
 
 def new_tab(url="about:blank"):
+    """Open a background tab you own and make it current. With a url, an empty current tab is reused."""
     # Always create blank, then goto: passing url to createTarget races with
     # attach, so the brief about:blank is "complete" by the time the caller
     # polls and wait_for_load() returns before navigation actually starts.
-    if url != "about:blank":
-        try:
-            cur = current_tab()
-            cur_url = cur.get("url") or ""
-            # Reuse attached tab when it's blank
-            if (
-                cur_url in ("", "about:blank", "data:text/html,")
-                or cur_url.startswith("about:blank#")
-                or cur_url.startswith(("chrome://newtab", "chrome://new-tab-page", "edge://newtab", "about:newtab"))
-            ):
-                goto_url(url)
-                return cur.get("targetId") or cur.get("target_id")
-        except Exception:
-            pass
-    tid = cdp("Target.createTarget", url="about:blank", background=True)["targetId"]
-    switch_tab(tid)
+    tid = _send({"meta": "new_tab", "reuse": url != "about:blank"})["target_id"]
     if url != "about:blank":
         goto_url(url)
     return tid
 
 def close_tab(target=None):
-    """Close a tab. If `target` is omitted, closes the currently attached tab.
-    Accepts a raw targetId string or a dict from list_tabs()/current_tab()."""
-    target_id = _target_id(target)
-    if target_id is None:
-        target_id = current_tab()["targetId"]
-    cdp("Target.closeTarget", targetId=target_id)
+    """Close one of your tabs, the current one by default. Accepts a target id or a tab dict."""
+    return _send({"meta": "close_tab", "target_id": _target_id(target)})["closed"]
 
 
 def ensure_real_tab():
-    """Switch to a real user tab if current is chrome:// / internal / stale."""
-    tabs = list_tabs(include_chrome=False)
-    if not tabs:
-        return None
-    try:
-        cur = current_tab()
-        if cur["url"] and not cur["url"].startswith(INTERNAL):
-            return cur
-    except Exception:
-        pass
-    switch_tab(tabs[0]["targetId"])
-    return tabs[0]
+    """Your current tab, opening your own background tab if you have none. Never takes the person's tab."""
+    return current_tab()
 
 def iframe_target(url_substr):
     """First iframe target whose URL contains `url_substr`. Use with js(..., target_id=...)."""

@@ -31,6 +31,7 @@ from .admin import (
 )
 from . import auth, recorder, telemetry
 from .helpers import *
+from .helpers import _warn_shared_owner
 
 HELP = """Browser Harness
 
@@ -405,6 +406,7 @@ def _run(args):
             # Setup/permission errors are instructions for calling agent
             print(f"browser-harness: {e}", file=sys.stderr)
             sys.exit(1)
+    _warn_shared_owner()
     _install_helper_trace()
     exec(code, globals())
 

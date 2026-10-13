@@ -185,6 +185,32 @@ def test_require_existing_daemon_probes_cdp(monkeypatch):
     assert sock.closed is True
 
 
+@pytest.mark.parametrize(("have", "mismatch"), [("127.0.0.1:9333", False), ("127.0.0.1:9222", True), ("local", True), (None, False)])
+def test_daemon_must_drive_the_browser_the_env_points_at(monkeypatch, have, mismatch):
+    monkeypatch.delenv("BU_CDP_WS", raising=False)
+    monkeypatch.setenv("BU_CDP_URL", "http://127.0.0.1:9333")
+    monkeypatch.setattr(admin, "_ping", lambda _name=None: {"pong": True, **({"endpoint": have} if have else {})})
+
+    if mismatch:
+        with pytest.raises(RuntimeError, match=f"browser-mismatch: daemon 'rig' drives {have}, but .* points at 127.0.0.1:9333"):
+            admin._check_same_browser("rig")
+    else:
+        admin._check_same_browser("rig")
+
+
+def test_browser_check_is_skipped_without_an_explicit_endpoint(monkeypatch):
+    monkeypatch.delenv("BU_CDP_WS", raising=False)
+    monkeypatch.delenv("BU_CDP_URL", raising=False)
+    monkeypatch.setattr(admin, "_ping", lambda _name=None: pytest.fail("no ping needed"))
+
+    admin._check_same_browser("remote")
+
+
+def test_endpoint_label_never_carries_credentials_or_paths():
+    assert admin.ipc.endpoint_label({"BU_CDP_WS": "wss://user:secret@cloud.example:443/devtools/browser/x?token=t"}) == "cloud.example:443"
+    assert admin.ipc.endpoint_label({}) == "local"
+
+
 @pytest.mark.parametrize("kind", ["cloud", None])
 @pytest.mark.parametrize("failure", ["timeout", "error"])
 def test_cloud_health_failure_preserves_browser_and_recovers_on_retry(monkeypatch, kind, failure):
