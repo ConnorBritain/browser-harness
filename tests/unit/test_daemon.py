@@ -1,6 +1,8 @@
 import asyncio
 import json
 import os
+import socket
+import time
 
 import pytest
 
@@ -675,6 +677,69 @@ def test_close_inspect_tabs_only_when_the_harness_opened_one(monkeypatch, tmp_pa
     monkeypatch.setattr(daemon, "harness_opened_inspect", lambda: True)
     asyncio.run(d._close_inspect_tabs([d.cdp.info(t) for t in list(d.cdp.pages)]))
     assert list(d.cdp.pages) == ["person-tab"]
+
+
+# --- lifecycle ---
+
+def test_ping_reports_protocol_and_other_active_owners():
+    d = _daemon()
+    _run(d, cmd("a"), cmd("b"), meta("c", "tabs"))
+    d.owners["b"].seen = 0
+
+    me, other = _run(d, {"meta": "ping", "owner": "a"}, {"meta": "ping", "owner": "z"})
+
+    assert me["protocol"] == other["protocol"] == daemon.ipc.PROTOCOL
+    assert (me["active"], other["active"]) == (0, 1)  # b idle, c holds no tab
+
+
+def test_ping_is_not_activity():
+    d = _daemon()
+    d.last = 0
+    _run(d, {"meta": "ping"})
+    assert d.last == 0
+    _run(d, meta("a", "tabs"))
+    assert d.last > 0
+
+
+@pytest.mark.parametrize(("name", "kind", "exits"), [
+    ("default", "local", False), ("work", "local", True), ("default", "cdp", True), ("remote", "cloud", True)])
+def test_idle_exit_spares_only_the_default_local_daemon(monkeypatch, name, kind, exits):
+    monkeypatch.setattr(daemon, "NAME", name)
+    monkeypatch.setattr(daemon, "BROWSER_KIND", kind)
+    monkeypatch.setattr(daemon, "log", lambda _m: None)
+    d = _daemon()
+    d.stop = asyncio.Event()
+    d.last = time.time() - daemon.IDLE_EXIT - 1
+
+    asyncio.run(d.sweep())
+
+    assert d.stop.is_set() is exits
+
+
+def test_recent_activity_keeps_a_named_daemon(monkeypatch):
+    monkeypatch.setattr(daemon, "NAME", "work")
+    d = _daemon()
+    d.stop = asyncio.Event()
+
+    asyncio.run(d.sweep())
+
+    assert not d.stop.is_set()
+
+
+def test_daemon_exits_when_the_browser_connection_closes(monkeypatch):
+    monkeypatch.setattr(daemon, "log", lambda _m: None)
+    monkeypatch.setattr(daemon.ipc, "cleanup_endpoint", lambda _name: None)
+
+    async def serve_forever(*_a):
+        await asyncio.Event().wait()
+    monkeypatch.setattr(daemon.ipc, "serve", serve_forever)
+
+    async def go():
+        d = _daemon()
+        d.stop = asyncio.Event()
+        d.cdp._message_handler_task = asyncio.create_task(asyncio.sleep(0.01))  # the websocket reader ends
+        await asyncio.wait_for(daemon.serve(d), timeout=2)
+    asyncio.run(go())
 
 
 # --- owner state survives a daemon restart ---

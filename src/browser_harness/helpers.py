@@ -37,9 +37,7 @@ _load_env()
 
 NAME = os.environ.get("BU_NAME", "default")
 SOCK = ipc.sock_addr(NAME)
-# Which agent is calling. Each owner drives only its own tabs. Sub-agents
-# inherit their parent's session id, so they need their own BH_OWNER.
-OWNER = os.environ.get("BH_OWNER") or os.environ.get("CLAUDE_CODE_SESSION_ID") or os.environ.get("CODEX_THREAD_ID") or "default"
+OWNER = ipc.owner()  # each owner drives only its own tabs
 INTERNAL = ("chrome://", "chrome-untrusted://", "devtools://", "chrome-extension://", "about:")
 IPC_CONNECT_TIMEOUT_SECONDS = 5.0
 DEFAULT_IPC_RESPONSE_TIMEOUT_SECONDS = 5.0

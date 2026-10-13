@@ -376,7 +376,7 @@ def _ping(name=None):
     c = None
     try:
         c, token = ipc.connect(name or NAME, timeout=1.0)
-        response = ipc.request(c, token, {"meta": "ping"})
+        response = ipc.request(c, token, {"meta": "ping", "owner": ipc.owner()})
         return response if isinstance(response, dict) else {}
     except (FileNotFoundError, ConnectionRefusedError, TimeoutError, socket.timeout, OSError, ValueError):
         return {}
@@ -392,6 +392,23 @@ def daemon_browser_kind(name=None):
     from an older version."""
     kind = _ping(name).get("browser_kind")
     return kind if kind in {"cloud", "cdp", "local"} else None
+
+
+def _restart_if_outdated(name=None):
+    """A daemon on another protocol is stopped only when no other agent uses it and it
+    holds no Cloud browser; a newer client on the same protocol just uses it."""
+    ping = _ping(name)
+    have = ping.get("protocol", 1)
+    if not ping.get("pong") or have == ipc.PROTOCOL:  # an unanswered ping is no reason to drop a healthy connection
+        return False
+    if ping.get("active") or ping.get("browser_kind") == "cloud":
+        raise RuntimeError(
+            f"daemon-outdated: daemon {name or NAME!r} speaks protocol {have}, this client {ipc.PROTOCOL}. "
+            f"It was not restarted because {'its Cloud browser would stop' if ping.get('browser_kind') == 'cloud' else 'other agents are using it'}. "
+            "Nothing was sent. Retry when they finish, or run browser-harness --reload."
+        )
+    restart_daemon(name)
+    return True
 
 
 def _check_same_browser(name=None):
@@ -557,19 +574,21 @@ def ensure_daemon(wait=None, name=None, env=None):
             except Exception:
                 resp = {}
             if isinstance(resp, dict) and "result" in resp:
-                return _check_same_browser(name)
+                _check_same_browser(name)
+                if not _restart_if_outdated(name):
+                    return
+                break
             if not last: time.sleep(0.5)
-        browser_kind = daemon_browser_kind(name)
-        if browser_kind in {"cloud", None}:
-            # A failed CDP probe can be temporary. Shutdown destroys the Cloud
-            # session; this caller may not have its transport to reconnect.
-            # Unknown kind may also own a Cloud browser. Leave cleanup explicit.
-            raise RuntimeError(
-                f"daemon {name or NAME!r} is unhealthy; existing browser preserved. "
-                f"Retry after it recovers, or explicitly stop_remote_daemon({name or NAME!r}) "
-                "when finished; the Cloud browser still bills until stopped or timed out."
-            )
         else:
+            if daemon_browser_kind(name) in {"cloud", None}:
+                # A failed CDP probe can be temporary. Shutdown destroys the Cloud
+                # session; this caller may not have its transport to reconnect.
+                # Unknown kind may also own a Cloud browser. Leave cleanup explicit.
+                raise RuntimeError(
+                    f"daemon {name or NAME!r} is unhealthy; existing browser preserved. "
+                    f"Retry after it recovers, or explicitly stop_remote_daemon({name or NAME!r}) "
+                    "when finished; the Cloud browser still bills until stopped or timed out."
+                )
             restart_daemon(name)
 
     import subprocess, sys
@@ -586,29 +605,26 @@ def ensure_daemon(wait=None, name=None, env=None):
             stderr_sink = open(ipc.log_path(name or NAME), "ab")
         except OSError:
             stderr_sink = subprocess.DEVNULL
-        if local:
-            with _spawn_lock(name, timeout=startup_wait) as lock:
-                if lock.fd is None:
-                    raise RuntimeError("daemon-starting: another browser-harness daemon is still starting; retry later")
-                if daemon_alive(name):
-                    if stderr_sink is not subprocess.DEVNULL:
-                        stderr_sink.close()
-                    return
-                pending_pid = _parked_daemon_pid(name) or _starting_daemon_pid(name)
-                if pending_pid:
-                    p = None
-                else:
-                    p = subprocess.Popen(
-                        [sys.executable, "-m", "browser_harness.daemon"],
-                        env=e, stdout=subprocess.DEVNULL, stderr=stderr_sink, **ipc.spawn_kwargs(),
-                    )
-                    _publish_pid(ipc.pid_path(name or NAME), p.pid)
-                    pending_pid = p.pid
-        else:
-            p = subprocess.Popen(
-                [sys.executable, "-m", "browser_harness.daemon"],
-                env=e, stdout=subprocess.DEVNULL, stderr=stderr_sink, **ipc.spawn_kwargs(),
-            )
+        # One spawner per daemon name, for every browser kind: agents starting
+        # together share one daemon and one browser connection (one Allow).
+        with _spawn_lock(name, timeout=startup_wait) as lock:
+            if lock.fd is None:
+                raise RuntimeError("daemon-starting: another browser-harness daemon is still starting; retry later")
+            if daemon_alive(name):
+                if stderr_sink is not subprocess.DEVNULL:
+                    stderr_sink.close()
+                return
+            ipc.sweep_dead_endpoints()
+            pending_pid = _parked_daemon_pid(name) or _starting_daemon_pid(name)
+            if pending_pid:
+                p = None
+            else:
+                p = subprocess.Popen(
+                    [sys.executable, "-m", "browser_harness.daemon"],
+                    env=e, stdout=subprocess.DEVNULL, stderr=stderr_sink, **ipc.spawn_kwargs(),
+                )
+                _publish_pid(ipc.pid_path(name or NAME), p.pid)
+                pending_pid = p.pid
         if stderr_sink is not subprocess.DEVNULL:
             stderr_sink.close()
         spawned = time.monotonic()
@@ -1601,11 +1617,8 @@ def run_update(yes=False):
     cache.pop("banner_shown_on", None)
     _cache_write(cache)
 
-    if daemon_alive():
-        if _prompt_yes("restart the running daemon so it picks up the new code?", default_yes=True, yes=yes):
-            restart_daemon()
-            print("daemon stopped; it will auto-restart on next `browser-harness` call.")
-        else:
-            print("daemon left running on old code. run `browser-harness` and it'll use the new code after the daemon recycles.")
-    print("update complete.")
+    # The daemon only holds the browser connection; new helpers work through it as
+    # is. Restarting it would make Chrome ask to Allow again. A protocol change is
+    # handled on the next call, once no other agent is using the daemon.
+    print("update complete. The running daemon keeps its browser connection.")
     return 0
