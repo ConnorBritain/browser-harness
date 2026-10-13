@@ -525,14 +525,23 @@ class Daemon:
             return o.current
 
     async def _session(self, key, o, tid):
-        """The owner's session on its tab, attached once on first use. None once the tab is gone."""
+        """The owner's session on its tab, attached once on first use. A gone tab raises tab-closed."""
         async with o.lock:
             if tid in o.tabs and o.tabs[tid] is None:
-                sid = (await self.cdp.send_raw("Target.attachToTarget", {"targetId": tid, "flatten": True}))["sessionId"]
-                o.tabs[tid], self.session_owner[sid] = sid, key
-                await self._enable_default_domains(sid)
-                self._mark(key, tid)
-            return o.tabs.get(tid)
+                try:
+                    sid = (await self.cdp.send_raw("Target.attachToTarget", {"targetId": tid, "flatten": True}))["sessionId"]
+                except RuntimeError as e:
+                    if "No target with given id" not in str(e):
+                        raise
+                    self._drop(tid)  # closed after it was taken, before first use
+                else:
+                    o.tabs[tid], self.session_owner[sid] = sid, key
+                    await self._enable_default_domains(sid)
+                    self._mark(key, tid)
+            if tid not in o.tabs:
+                o.gone = None
+                raise RuntimeError(self._closed(o, tid))
+            return o.tabs[tid]
 
     def _mark(self, key, tid, prefix=None):
         """Show in the tab title which agent holds it and its mark, off the synchronous IPC path."""
@@ -778,10 +787,13 @@ class Daemon:
             if req.get("url") and info.get("url") != req["url"]:
                 return {"error": f"tab-changed: tab {tid} now shows {info.get('url')}, not {req['url']}. Nothing was sent. Call list_tabs() and pick again."}
             o.gone = None
-            self._own(key, tid)
+            self._own(key, tid, current=False)
+            sid = await self._session(key, o, tid)  # the current tab moves only once the new one is attached
+            o.current = tid
+            self._save()
             if req.get("activate"):
                 await self.cdp.send_raw("Target.activateTarget", {"targetId": tid})
-            return {"target_id": tid, "session_id": await self._session(key, o, tid)}
+            return {"target_id": tid, "session_id": sid}
         if meta == "new_tab":
             o.gone = None
             reuse = req.get("reuse") and o.current and is_blank(self.info.get(o.current, {}).get("url", "-"))
@@ -827,15 +839,7 @@ class Daemon:
         async with o.lock:
             if o.tabs.get(tid) == sid:
                 o.tabs[tid] = None
-        try:
-            sid = await self._session(key, o, tid)
-        except Exception:
-            sid = None
-        if sid is None:
-            error = self._closed(o, tid)
-            self._drop(tid)
-            o.gone = None
-            return {"error": error}
+        sid = await self._session(key, o, tid)  # raises tab-closed when the tab is gone
         return {"result": await self.cdp.send_raw(method, params, session_id=sid)}
 
 

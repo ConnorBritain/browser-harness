@@ -232,6 +232,27 @@ def test_switch_to_another_owners_tab_is_tab_taken_and_attaches_nothing():
     assert d.tab_owner == {"person-tab": "a"}
 
 
+def test_tab_closed_during_a_switch_is_tab_closed_and_keeps_your_current_tab():
+    """Found by the soak: c closes its tab while b's switch_tab awaits the tab info."""
+    d = _daemon()
+    _run(d, cmd("b"), cmd("c"))
+    real = d.cdp.send_raw
+
+    async def close_meanwhile(method, params=None, session_id=None):
+        r = await real(method, params, session_id)
+        if method == "Target.getTargetInfo" and params["targetId"] == "tab-3":
+            d.cdp.pages.pop("tab-3")
+            d._record_event("Target.targetDestroyed", {"targetId": "tab-3"})
+        return r
+    d.cdp.send_raw = close_meanwhile
+
+    switched, after = _run(d, meta("b", "switch_tab", target_id="tab-3"), cmd("b"))
+
+    assert switched["error"].startswith("tab-closed: your tab tab-3")
+    assert d.owners["b"].current == "tab-1" and list(d.owners["b"].tabs) == ["tab-1"]
+    assert after == {"result": {}} and d.tab_owner == {"tab-1": "b"}
+
+
 def test_switch_tab_with_a_moved_url_is_tab_changed():
     d = _daemon(PERSON)
 
