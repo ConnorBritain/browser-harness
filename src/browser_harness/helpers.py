@@ -485,11 +485,17 @@ def iframe_target(url_substr):
 def wait(seconds=1.0):
     time.sleep(seconds)
 
-def wait_for_load(timeout=15.0):
-    """Poll document.readyState == 'complete' or timeout."""
+def wait_for_load(timeout=8.0, idle_ms=500):
+    """True once document.readyState is 'complete', or 'interactive' with no network event for idle_ms (pages
+    whose ads or trackers never finish). False after timeout."""
     deadline = time.time() + timeout
+    session = _send({"meta": "session"}).get("session_id")
+    quiet_since = time.time()
     while time.time() < deadline:
-        if js("document.readyState") == "complete": return True
+        if any(e.get("session_id") == session and e.get("method", "").startswith("Network.") for e in drain_events()):
+            quiet_since = time.time()
+        state = js("document.readyState")
+        if state == "complete" or (state == "interactive" and (time.time() - quiet_since) * 1000 >= idle_ms): return True
         time.sleep(0.3)
     return False
 
