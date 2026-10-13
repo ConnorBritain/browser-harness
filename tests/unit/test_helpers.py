@@ -471,6 +471,46 @@ def test_list_tabs_hides_other_agents_tabs(monkeypatch):
     ]
 
 
+def _browsers(monkeypatch, running):
+    from browser_harness import admin
+    monkeypatch.setattr(admin, "_daemon_endpoint_names", lambda: ["default", "rig", "stale"])
+    monkeypatch.setattr(admin, "_ping", lambda name=None: running.get(name, {}))
+
+
+def test_list_browsers_shows_live_daemons(monkeypatch):
+    _browsers(monkeypatch, {"default": {"pong": True, "browser_kind": "local", "endpoint": "local"},
+                            "rig": {"pong": True, "browser_kind": "cdp", "endpoint": "127.0.0.1:9555"}})
+    monkeypatch.setattr(helpers, "NAME", "rig")
+
+    assert helpers.list_browsers() == [
+        {"name": "default", "kind": "local", "endpoint": "local", "current": False},
+        {"name": "rig", "kind": "cdp", "endpoint": "127.0.0.1:9555", "current": True},
+    ]
+
+
+@pytest.mark.parametrize("name", ["stale", "nope", "../x", 7])
+def test_use_browser_never_falls_back(monkeypatch, name):
+    _browsers(monkeypatch, {"default": {"pong": True}})
+    monkeypatch.setattr(helpers, "NAME", "default")
+
+    with pytest.raises(RuntimeError, match=r"browser-not-found: no browser .* is running; running: default\. Nothing was sent\."):
+        helpers.use_browser(name)
+    assert helpers.NAME == "default"
+
+
+def test_use_browser_routes_the_next_commands(monkeypatch):
+    _browsers(monkeypatch, {"rig": {"pong": True}})
+    monkeypatch.setattr(helpers, "NAME", "default")
+    seen = []
+    monkeypatch.setattr(helpers.ipc, "connect", lambda name, timeout: seen.append(name) or (type("S", (), {"settimeout": lambda s, t: None, "close": lambda s: None})(), None))
+    monkeypatch.setattr(helpers.ipc, "request", lambda c, t, req: {})
+
+    helpers.use_browser("rig")
+    helpers._send({"meta": "tabs"})
+
+    assert seen == ["rig"]
+
+
 def test_mark_tab_and_name_session_are_daemon_commands(monkeypatch):
     sent = _daemon_replies(monkeypatch, {"mark": "deliverable", "name": "shop"})
 

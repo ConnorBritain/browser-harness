@@ -388,6 +388,23 @@ def list_tabs(include_chrome=True):
         out.append(tab)
     return out
 
+def list_browsers():
+    """Running browsers, one per daemon name: [{name, kind, endpoint, current}]."""
+    from .admin import _daemon_endpoint_names, _ping
+    return [{"name": n, "kind": p.get("browser_kind"), "endpoint": p.get("endpoint"), "current": n == NAME}
+            for n in _daemon_endpoint_names() if (p := _ping(n)).get("pong")]
+
+def use_browser(name):
+    """Send the next commands to the running browser `name` (see list_browsers()).
+    An unknown name fails with browser-not-found; it never falls back to another browser."""
+    global NAME
+    from .admin import _ping
+    if not _ping(str(name)).get("pong"):
+        running = ", ".join(b["name"] for b in list_browsers()) or "none"
+        raise RuntimeError(f"browser-not-found: no browser {name!r} is running; running: {running}. Nothing was sent.")
+    NAME = name
+    return name
+
 def name_session(name):
     """Name your session. Your tabs' titles show it, so the person sees which agent holds which tab."""
     return _send({"meta": "name_session", "name": name})["name"]
