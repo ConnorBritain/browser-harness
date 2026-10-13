@@ -431,6 +431,15 @@ def test_current_tab_meta_passes_the_owners_target_id():
     assert [p for m, p, s in d.cdp.calls if m == "Target.getTargetInfo"][-1] == {"targetId": "person-tab"}
 
 
+def test_an_old_clients_request_opens_no_tab():
+    d = _daemon()
+
+    [r] = _run(d, {"meta": "set_session", "session_id": "s", "target_id": "t"})
+
+    assert r["error"].startswith("unknown request 'set_session': this daemon speaks protocol")
+    assert d.cdp.calls == []
+
+
 def test_connection_status_is_healthy_before_any_tab():
     d = _daemon(PERSON)
 

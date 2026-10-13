@@ -801,16 +801,16 @@ class Daemon:
                 "Target.createTarget", {"url": "about:blank", "background": True}))["targetId"]
             self._own(key, tid, created=not reuse)
             return {"target_id": tid, "session_id": await self._session(key, o, tid)}
+        if meta not in ("session", "current_tab"):
+            return {"error": f"unknown request {meta!r}: this daemon speaks protocol {ipc.PROTOCOL}; update browser-harness"}
         if o.gone:
             gone, o.gone = o.gone, None
             return {"error": gone}
         tid = await self._current(key, o)
         if meta == "session":
             return {"session_id": await self._session(key, o, tid)}
-        if meta == "current_tab":
-            info = (await self.cdp.send_raw("Target.getTargetInfo", {"targetId": tid}))["targetInfo"]
-            return {"targetId": tid, "url": info.get("url", ""), "title": info.get("title", "")}
-        return {"error": f"unknown meta {meta!r}"}
+        info = (await self.cdp.send_raw("Target.getTargetInfo", {"targetId": tid}))["targetInfo"]
+        return {"targetId": tid, "url": info.get("url", ""), "title": info.get("title", "")}
 
     async def _send(self, key, o, req):
         method, params, sid = req["method"], req.get("params") or {}, req.get("session_id")
