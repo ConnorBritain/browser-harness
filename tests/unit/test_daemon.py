@@ -749,6 +749,29 @@ def test_an_idle_owners_tab_can_be_taken_and_it_learns_tab_released():
     assert after == {"result": {}} and d.owners["a"].current not in (None, "tab-1")
 
 
+def test_release_tabs_closes_what_the_agent_opened_and_leaves_the_rest(monkeypatch):
+    """Found on real Chrome: an agent that finished left its own about:blank tab behind."""
+    monkeypatch.delenv("BH_CLOSE_IDLE_TABS", raising=False)
+    d = _idle_owner_with_five_tabs(monkeypatch)
+    d.owners["a"].seen = time.time()
+
+    [r, after] = _run(d, meta("a", "release_tabs"), cmd("a"))
+
+    assert r == {"released": True}
+    assert sorted(d.cdp.pages) == ["person-2", "person-tab", "tab-3", "tab-9"]  # tab-1 and tab-7 closed, tab-9 is new
+    assert sorted(t for p, t in _titles(d) if p == "") == ["person-tab"]
+    assert after == {"result": {}} and d.tab_owner == {"tab-9": "a"}  # no stale tab-closed afterwards
+
+
+def test_close_tab_closes_the_tab_the_agent_opened():
+    d = _daemon(PERSON)
+    _run(d, cmd("a"))
+
+    [r] = _run(d, meta("a", "close_tab"))
+
+    assert r == {"closed": "tab-1"} and list(d.cdp.pages) == ["person-tab"] and d.tab_owner == {}
+
+
 def test_after_idle_the_next_command_still_goes_to_the_same_tab():
     """Review B1: the agent waits 31 min for an approval, then clicks in its form or handoff tab."""
     d = _daemon(PERSON)
