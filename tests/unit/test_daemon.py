@@ -285,6 +285,35 @@ def test_switch_tab_with_a_moved_url_is_tab_changed():
     assert d.tab_owner == {}
 
 
+def test_switching_to_your_own_tab_never_fails_tab_changed():
+    """t = current_tab(); the page redirects; switch_tab(t) must still work."""
+    d = _daemon()
+    _run(d, cmd("a"))
+    d.cdp.pages["tab-1"] = "https://x.example/after-redirect"
+
+    [r] = _run(d, meta("a", "switch_tab", target_id="tab-1", url="about:blank"))
+
+    assert r["target_id"] == "tab-1"
+
+
+def test_close_tab_without_a_tab_says_so():
+    d = _daemon()
+
+    [r] = _run(d, meta("a", "close_tab"))
+
+    assert r == {"error": "close_tab: you have no current tab. Your tabs: none."}
+
+
+def test_a_dialog_goes_away_with_its_tab():
+    d = _daemon()
+    _run(d, cmd("a"), meta("a", "new_tab"))
+    d._record_event("Page.javascriptDialogOpening", {"message": "leave?"}, d.owners["a"].tabs["tab-1"])
+
+    before, _, after = _run(d, meta("a", "pending_dialog"), meta("a", "close_tab", target_id="tab-1"), meta("a", "pending_dialog"))
+
+    assert before == {"dialog": {"message": "leave?"}} and after == {"dialog": None}
+
+
 def test_switch_to_a_missing_tab_is_tab_closed():
     d = _daemon()
 
@@ -314,7 +343,7 @@ def test_raw_attach_session_belongs_to_its_owner():
                 {**cmd("b", "Runtime.evaluate", expression="1"), "session_id": sid})
 
     assert a == {"result": {}}
-    assert b["error"].startswith("tab-taken:")
+    assert b["error"].startswith(f"tab-taken: session {sid} is driven by another agent.")
 
 
 def test_another_agents_tab_shows_no_url_or_title_even_to_raw_cdp():
@@ -658,6 +687,15 @@ def test_tab_title_shows_owner_and_mark_on_attach_load_name_and_mark(monkeypatch
 
     assert _titles(d) == [("\U0001F434agent7 ", "tab-1"), ("\U0001F434checkout-bot ", "tab-1"),
                           ("\U0001F434checkout-bot✋ ", "tab-1"), ("\U0001F434checkout-bot✋ ", "tab-1")]
+
+
+def test_a_session_id_is_never_written_into_a_title(monkeypatch):
+    monkeypatch.delenv("BH_TAB_MARKER", raising=False)
+    d = _daemon()
+
+    _settle(d, cmd("a824b551-3041-4f69-a2a6-456b44e6834f"), cmd("019a3f2c7b1d7e4f9a3c5d6e7f8091a2"), cmd("checkout-agent"))
+
+    assert [p for p, _t in _titles(d)] == ["\U0001F434 ", "\U0001F434 ", "\U0001F434checkoutagen "]
 
 
 def test_default_owner_keeps_the_plain_horse(monkeypatch):
@@ -1072,6 +1110,18 @@ def test_owner_tabs_survive_a_daemon_restart():
     assert set(again.owners["a"].tabs) == {"tab-1", "person-tab"}
     assert (again.owners["a"].name, again.owners["a"].marks, again.owners["a"].created) == ("shop", {"person-tab": "handoff"}, {"tab-1"})
     assert [d.cdp.tab_of(s) for s in d.cdp.sent("Input.insertText")][-2:] == ["person-tab", "tab-7"]
+
+
+@pytest.mark.parametrize("content", ["[]", '{"a": {"tabs": ["t"], "marks": null}}', '{"a": 1}', "{not json"])
+def test_a_damaged_state_file_never_keeps_the_daemon_from_starting(monkeypatch, content):
+    monkeypatch.setattr(daemon, "log", lambda _m: None)
+    daemon.STATE.write_text(content)
+    d = _daemon(("t", "https://x.example/"))
+
+    d._load({"t"})
+    [r] = _run(d, cmd("b"))
+
+    assert r == {"result": {}}
 
 
 def test_shutdown_closes_no_tabs(monkeypatch):

@@ -273,6 +273,7 @@ def test_browser_check_is_skipped_without_an_explicit_endpoint(monkeypatch):
 def test_endpoint_label_never_carries_credentials_or_paths():
     assert admin.ipc.endpoint_label({"BU_CDP_WS": "wss://user:secret@cloud.example:443/devtools/browser/x?token=t"}) == "cloud.example:443"
     assert admin.ipc.endpoint_label({}) == "local"
+    assert admin.ipc.endpoint_label({"BU_CDP_URL": "http://localhost:9222"}) == admin.ipc.endpoint_label({"BU_CDP_WS": "ws://127.0.0.1:9222/devtools/browser/x"})
 
 
 @pytest.mark.parametrize("kind", ["cloud", None])

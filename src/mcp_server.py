@@ -205,7 +205,7 @@ def browser_screenshot(
 
 @_tool
 def browser_list_tabs():
-    """List open page tabs."""
+    """List open tabs with their owner: "you", null (the person's) or "taken" (another agent's)."""
     return list_tabs()
 
 
@@ -217,13 +217,13 @@ def browser_current_tab():
 
 @_tool
 def browser_switch_tab(target: str):
-    """Switch to tab by `targetId` or URL substring. Returns the sessionId."""
+    """Take a tab by `targetId` and make it your current one. Returns the sessionId."""
     return {"sessionId": switch_tab(target)}
 
 
 @_tool
 def browser_close_tab(target: str | None = None):
-    """Close a tab. Without `target`, closes the active tab."""
+    """Close one of your tabs. Without `target`, closes your current tab."""
     close_tab(target)
     return {"ok": True}
 

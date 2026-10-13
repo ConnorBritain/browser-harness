@@ -39,7 +39,7 @@ Read SKILL.md for the default workflow and examples.
 
 Typical usage:
   browser-harness <<'PY'
-  ensure_real_tab()
+  new_tab("https://example.com")
   print(page_info())
   PY
 

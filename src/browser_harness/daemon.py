@@ -426,6 +426,7 @@ class Owner:
     current: str | None = None
     events: deque = field(default_factory=lambda: deque(maxlen=BUF))
     dialog: dict | None = None
+    dialog_session: str | None = None  # the tab session showing `dialog`
     gone: str | None = None  # typed error returned once on the owner's next command
     seen: float = field(default_factory=time.time)
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
@@ -479,8 +480,8 @@ class Daemon:
             self._drop(tid, taken=True)  # its owner went idle; it learns this on its next command
         self._own(key, tid, **how)
 
-    def _taken(self, o, tid):
-        return {"error": f"tab-taken: tab {tid} is driven by another agent. Nothing was sent. {self._yours(o)}"}
+    def _taken(self, o, tid, what="tab"):
+        return {"error": f"tab-taken: {what} {tid} is driven by another agent. Nothing was sent. {self._yours(o)}"}
 
     def _closed(self, o, tid, taken=False):
         url = self.info.get(tid, {}).get("url", "")
@@ -509,7 +510,10 @@ class Daemon:
         if key is None:
             return
         o = self.owners[key]
-        self.session_owner.pop(o.tabs.pop(tid, None), None)
+        sid = o.tabs.pop(tid, None)
+        self.session_owner.pop(sid, None)
+        if sid and sid == o.dialog_session:
+            o.dialog = None  # its dialog went with it
         o.marks.pop(tid, None)
         o.created.discard(tid)
         if o.current == tid:
@@ -530,16 +534,16 @@ class Daemon:
         """Owners keep their tabs, names and marks across daemon restarts."""
         try:
             state = json.loads(STATE.read_text())
-        except (OSError, ValueError):
-            return
-        for key, saved in state.items():
-            o = self.owner(key)
-            o.name = saved.get("name")
-            for tid in saved.get("tabs", []):
-                if tid in pages:
-                    self._own(key, tid, current=tid == saved.get("current"), created=tid in saved.get("created", []))
-                    if mark := saved.get("marks", {}).get(tid):
-                        o.marks[tid] = mark
+            for key, saved in state.items():
+                o = self.owner(key)
+                o.name = saved.get("name")
+                for tid in saved.get("tabs", []):
+                    if tid in pages:
+                        self._own(key, tid, current=tid == saved.get("current"), created=tid in saved.get("created", []))
+                        if saved.get("marks", {}).get(tid) in MARKS:
+                            o.marks[tid] = saved["marks"][tid]
+        except Exception as e:  # a missing or damaged file must never keep the daemon from starting
+            log(f"load owners: {e!r}")
 
     async def _current(self, key, o):
         """The owner's current tab. A fresh owner gets its own background tab, never the person's."""
@@ -588,7 +592,8 @@ class Daemon:
         if not tab_marker_enabled() or not o.tabs.get(tid):
             return None
         if prefix is None:
-            label = o.name or ("" if key == "default" else re.sub(r"\W", "", key)[:6])
+            # A session id is no name: it would put id fragments into titles, history and page JS.
+            label = o.name or ("" if key == "default" or re.fullmatch(r"[0-9a-fA-F-]{16,}", key) else re.sub(r"\W", "", key)[:12])
             prefix = f"\U0001F434{label}{MARKS.get(o.marks.get(tid), '')} "
         return asyncio.create_task(_silent(asyncio.wait_for(
             self.cdp.send_raw("Runtime.evaluate", {"expression": tab_marker_js(prefix)}, session_id=o.tabs[tid]),
@@ -686,7 +691,7 @@ class Daemon:
         o = self.owners[key]
         o.events.append({"method": method, "params": params, "session_id": session_id})
         if method == "Page.javascriptDialogOpening":
-            o.dialog = params
+            o.dialog, o.dialog_session = params, session_id
         elif method == "Page.javascriptDialogClosed":
             o.dialog = None
         elif method in ("Page.loadEventFired", "Page.domContentEventFired"):
@@ -827,6 +832,8 @@ class Daemon:
             return {"target_id": o.current, "session_id": o.tabs.get(o.current), "page": page}
         if meta == "close_tab":
             tid = req.get("target_id") or o.current
+            if tid is None:
+                return {"error": f"close_tab: you have no current tab. {self._yours(o)}"}
             if err := self._mine(key, o, tid):
                 return err
             await self.cdp.send_raw("Target.closeTarget", {"targetId": tid})
@@ -840,7 +847,7 @@ class Daemon:
                 return {"error": f"tab-closed: tab {tid} does not exist. Nothing was sent. {self._yours(o)} Call list_tabs()."}
             if self._holder(tid) not in (None, key):
                 return self._taken(o, tid)
-            if req.get("url") and info.get("url") != req["url"]:
+            if req.get("url") and info.get("url") != req["url"] and self.tab_owner.get(tid) != key:
                 return {"error": f"tab-changed: tab {tid} now shows {info.get('url')}, not {req['url']}. Nothing was sent. Call list_tabs() and pick again."}
             o.gone = None
             self._take(key, tid, current=False)
@@ -886,7 +893,7 @@ class Daemon:
             return {"result": result}
         if sid:  # an explicit session gets exactly that session, never a redirect
             if self.session_owner.get(sid, key) != key:
-                return self._taken(o, sid)
+                return self._taken(o, sid, "session")
             return {"result": await self.cdp.send_raw(method, params, session_id=sid)}
         if o.gone:
             gone, o.gone = o.gone, None

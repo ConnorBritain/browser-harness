@@ -12,12 +12,15 @@ switch_tab(tabs[0])                   # take a tab (fails: tab-taken, tab-change
 activate_tab(tid)                     # optional: explicitly show it in Chrome
 mark_tab(tid, "deliverable")          # keep it open for the person when you finish
 close_tab(tid)                        # only your own tabs
+release_tabs()                        # done: close unmarked tabs you opened, give back the rest
 print(current_tab())
 print(page_info())
 ```
 
 Owners: `"you"`, `None` (the person's, free to take) or `"taken"` (another
-agent's; no title or url, and every command on it fails with `tab-taken`).
+agent's; no title or url, and switching to, attaching, closing or activating it
+fails with `tab-taken`). A tab whose agent has been idle for 30 minutes counts as
+free again; that agent gets `tab-released` on its next command.
 
 What CDP is good at:
 - attach to a tab
