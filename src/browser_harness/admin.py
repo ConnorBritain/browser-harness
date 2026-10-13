@@ -453,7 +453,7 @@ def _daemon_browser_connection(name):
     c = None
     try:
         c, token = ipc.connect(name, timeout=1.0)
-        response = ipc.request(c, token, {"meta": "connection_status"})
+        response = ipc.request(c, token, {"meta": "connection_status", "owner": ipc.owner()})
         if "error" in response:
             return None
         page = response.get("page")
@@ -575,7 +575,7 @@ def ensure_daemon(wait=None, name=None, env=None):
             try:
                 s, token = ipc.connect(name or NAME, timeout=3.0)
                 try:
-                    resp = ipc.request(s, token, {"method": "Target.getTargets", "params": {}})
+                    resp = ipc.request(s, token, {"method": "Target.getTargets", "params": {}, "owner": ipc.owner()})
                 finally:
                     s.close()
             except Exception:
@@ -766,7 +766,7 @@ def require_existing_daemon(name=None):
     try:
         s, token = ipc.connect(daemon_name, timeout=3.0)
         try:
-            resp = ipc.request(s, token, {"method": "Target.getTargets", "params": {}})
+            resp = ipc.request(s, token, {"method": "Target.getTargets", "params": {}, "owner": ipc.owner()})
         finally:
             s.close()
     except Exception as exc:
