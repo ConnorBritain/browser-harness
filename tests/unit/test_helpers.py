@@ -552,9 +552,8 @@ def test_owner_key_order(monkeypatch, env, owner):
         importlib.reload(helpers)
 
 
-def test_sub_agent_without_bh_owner_is_warned_once(monkeypatch, tmp_path, capsys):
-    monkeypatch.setattr(helpers.ipc, "_RUNTIME", tmp_path)
-    monkeypatch.setattr(helpers, "OWNER", "parent-session")
+def test_every_sub_agent_call_without_bh_owner_is_warned(monkeypatch, capsys):
+    """Review S3: sub-agents share the parent's session id, so a once-per-id flag warned only one of them."""
     monkeypatch.delenv("BH_OWNER", raising=False)
     monkeypatch.setenv("CLAUDE_CODE_CHILD_SESSION", "1")
 
@@ -562,8 +561,11 @@ def test_sub_agent_without_bh_owner_is_warned_once(monkeypatch, tmp_path, capsys
     helpers._warn_shared_owner()
     monkeypatch.setenv("BH_OWNER", "child")
     helpers._warn_shared_owner()
+    monkeypatch.delenv("BH_OWNER")
+    monkeypatch.delenv("CLAUDE_CODE_CHILD_SESSION")
+    helpers._warn_shared_owner()
 
-    assert capsys.readouterr().err.count("sub-agent without BH_OWNER") == 1
+    assert capsys.readouterr().err.count("sub-agent without BH_OWNER") == 2
 
 
 # --- press_key physical key identity (#685) ---
