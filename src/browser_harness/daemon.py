@@ -561,17 +561,21 @@ class Daemon:
         )))
 
     async def _release(self, key, o):
-        """The owner went idle. Marked tabs stay open and owned for the person; unmarked tabs it
-        opened close (never the browser's last tab); unmarked tabs it took are given back."""
+        """The owner went idle. Its current tab and its marked tabs are left alone. Its other
+        tabs are given back: detached, title cleaned, left open. Only with BH_CLOSE_IDLE_TABS=1
+        are the unmarked tabs it opened closed instead (never the browser's last real page)."""
+        close = os.environ.get("BH_CLOSE_IDLE_TABS") == "1"
         for tid, sid in list(o.tabs.items()):
+            if tid == o.current:
+                continue
             if tid in o.marks:
                 if sid:
                     o.tabs[tid] = None
                     self.session_owner.pop(sid, None)
                     await _silent(self.cdp.send_raw("Target.detachFromTarget", {"sessionId": sid}))
                 continue
-            last = sum(i.get("type") == "page" for i in self.info.values()) <= 1
-            if tid in o.created and not last:
+            last = sum(i.get("type") == "page" and is_real_page(i) for i in self.info.values()) <= 1
+            if close and tid in o.created and not last:
                 await _silent(self.cdp.send_raw("Target.closeTarget", {"targetId": tid}))
                 self.info.pop(tid, None)
             elif sid:
@@ -579,8 +583,6 @@ class Daemon:
                     await task
                 await _silent(self.cdp.send_raw("Target.detachFromTarget", {"sessionId": sid}))
             self._drop(tid)
-        o.current = o.gone = None
-        self._save()
 
     async def sweep(self):
         """Release owners idle longer than OWNER_IDLE; forget idle owners with no tabs.
@@ -592,10 +594,12 @@ class Daemon:
         for key, o in list(self.owners.items()):
             if time.time() - o.seen <= OWNER_IDLE:
                 continue
-            if any(o.tabs.values()) or o.tabs.keys() - o.marks.keys():
-                await self._release(key, o)
-            elif not o.tabs:
+            if not o.tabs:
                 del self.owners[key]
+                continue
+            async with o.lock:  # never under a command that is attaching or opening a tab
+                if time.time() - o.seen > OWNER_IDLE:  # the owner may have come back meanwhile
+                    await self._release(key, o)
 
     async def _close_inspect_tabs(self, targets):
         """Close chrome://inspect tabs left open by the permission recovery flow"""
@@ -660,7 +664,7 @@ class Daemon:
             self.info[tid] = info
             opener = self.tab_owner.get(info.get("openerId"))
             if method == "Target.targetCreated" and opener and info.get("type") == "page":
-                self._own(opener, tid, current=False, created=True)  # a popup belongs to its opener's owner
+                self._own(opener, tid, current=False)  # a popup belongs to its opener's owner; the person may have opened it
         elif method == "Target.targetDestroyed":
             self._drop(tid)
             self.info.pop(tid, None)

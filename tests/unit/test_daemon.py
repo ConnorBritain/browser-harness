@@ -657,9 +657,7 @@ def test_mark_tab_only_marks_your_tabs_with_a_known_mark():
     assert cleared == {"target_id": "tab-3", "mark": None} and d.owners["a"].marks == {"tab-1": "deliverable"}
 
 
-def test_idle_owner_release(monkeypatch):
-    """Marked tabs stay open and owned, unmarked tabs it opened close,
-    unmarked tabs it took go back to the person with a clean title."""
+def _idle_owner_with_five_tabs(monkeypatch):
     monkeypatch.delenv("BH_TAB_MARKER", raising=False)
     d = _daemon(PERSON, ("person-2", "https://docs.example/"))
     _run(d, cmd("a"), meta("a", "new_tab"), meta("a", "mark_tab", mark="deliverable"),
@@ -667,28 +665,95 @@ def test_idle_owner_release(monkeypatch):
          meta("a", "switch_tab", target_id="person-tab"), meta("a", "new_tab"))
     d.owners["a"].seen = 0
     d.cdp.calls.clear()
+    return d  # tab-1 opened, tab-3 deliverable, person-2 handoff, person-tab taken, tab-7 current
+
+
+def test_idle_release_gives_tabs_back_and_closes_nothing(monkeypatch):
+    """The current tab and marked tabs stay as they are; the rest is detached with a clean title."""
+    monkeypatch.delenv("BH_CLOSE_IDLE_TABS", raising=False)
+    d = _idle_owner_with_five_tabs(monkeypatch)
+    current_session = d.owners["a"].tabs["tab-7"]
 
     asyncio.run(d.sweep())
 
-    assert sorted(d.cdp.pages) == ["person-2", "person-tab", "tab-3"]  # tab-1 and tab-7 closed
-    assert d.tab_owner == {"tab-3": "a", "person-2": "a"}
-    assert d.owners["a"].tabs == {"tab-3": None, "person-2": None} and d.owners["a"].current is None
-    assert ("\U0001F434", "person-tab") not in _titles(d) and ("", "person-tab") in _titles(d)
-    assert sorted(d.cdp.tab_of(p["sessionId"]) for m, p, _s in d.cdp.calls if m == "Target.detachFromTarget") == ["person-2", "person-tab", "tab-3"]
+    assert sorted(d.cdp.pages) == ["person-2", "person-tab", "tab-1", "tab-3", "tab-7"]
+    assert d.cdp.sent("Target.closeTarget") == []
+    assert d.tab_owner == {"tab-3": "a", "person-2": "a", "tab-7": "a"}
+    assert d.owners["a"].current == "tab-7" and d.owners["a"].tabs["tab-7"] == current_session
+    assert sorted(t for p, t in _titles(d) if p == "") == ["person-tab", "tab-1"]
+    assert sorted(d.cdp.tab_of(p["sessionId"]) for m, p, _s in d.cdp.calls if m == "Target.detachFromTarget") == ["person-2", "person-tab", "tab-1", "tab-3"]
     d.cdp.calls.clear()
     asyncio.run(d.sweep())
     assert d.cdp.calls == []  # nothing left to release
 
 
-def test_idle_release_never_closes_the_browsers_last_tab():
-    d = _daemon()
-    _run(d, cmd("a"))
+def test_idle_release_closes_opened_tabs_only_when_asked(monkeypatch):
+    monkeypatch.setenv("BH_CLOSE_IDLE_TABS", "1")
+    d = _idle_owner_with_five_tabs(monkeypatch)
+
+    asyncio.run(d.sweep())
+
+    assert [p["targetId"] for m, p, _s in d.cdp.calls if m == "Target.closeTarget"] == ["tab-1"]
+    assert sorted(d.cdp.pages) == ["person-2", "person-tab", "tab-3", "tab-7"]
+
+
+def test_after_idle_the_next_command_still_goes_to_the_same_tab():
+    """Review B1: the agent waits 31 min for an approval, then clicks in its form or handoff tab."""
+    d = _daemon(PERSON)
+    _run(d, cmd("a"), meta("a", "mark_tab", mark="handoff"))
+    d.owners["a"].seen = 0
+
+    asyncio.run(d.sweep())
+    [r] = _run(d, cmd("a", text="continue"))
+
+    assert r == {"result": {}} and d.cdp.sent("Target.createTarget") == [None]
+    assert [d.cdp.tab_of(s) for s in d.cdp.sent("Input.insertText")] == ["tab-1", "tab-1"]
+
+
+def test_a_popup_from_an_owned_tab_is_never_closed_on_idle(monkeypatch):
+    """The person may have opened it from a handoff tab."""
+    monkeypatch.setenv("BH_CLOSE_IDLE_TABS", "1")
+    d = _daemon(PERSON)
+    _run(d, cmd("a"), meta("a", "mark_tab", mark="handoff"))
+    d.cdp.pages["popup"] = "https://bank.example/"
+    d._record_event("Target.targetCreated", {"targetInfo": {"targetId": "popup", "type": "page", "url": "https://bank.example/", "openerId": "tab-1"}})
+    d.owners["a"].seen = 0
+
+    asyncio.run(d.sweep())
+
+    assert "popup" in d.cdp.pages and "popup" not in d.tab_owner
+
+
+def test_release_waits_for_the_owners_running_command_and_then_skips():
+    """The owner comes back while the sweep waits for its lock: nothing is released."""
+    d = _daemon(PERSON)
+    _run(d, cmd("a"), meta("a", "new_tab"))
+
+    async def go():
+        o = d.owners["a"]
+        await o.lock.acquire()  # a command of the owner is attaching a tab
+        o.seen = 0
+        sweep = asyncio.create_task(d.sweep())
+        await asyncio.sleep(0.01)
+        o.seen = time.time()  # ... and it was a new request
+        o.lock.release()
+        await sweep
+    asyncio.run(go())
+
+    assert d.tab_owner == {"tab-1": "a", "tab-3": "a"} and d.cdp.sent("Target.detachFromTarget") == []
+
+
+def test_idle_release_never_closes_the_browsers_last_real_page(monkeypatch):
+    monkeypatch.setenv("BH_CLOSE_IDLE_TABS", "1")
+    d = _daemon(("settings", "chrome://settings/"))
+    _run(d, cmd("a", "Page.navigate", url="https://shop.example/"), meta("a", "new_tab"))
+    d.cdp.pages["tab-1"] = "https://shop.example/"
     d.info = {t: d.cdp.info(t) for t in d.cdp.pages}
     d.owners["a"].seen = 0
 
     asyncio.run(d.sweep())
 
-    assert list(d.cdp.pages) == ["tab-1"] and d.tab_owner == {}
+    assert "tab-1" in d.cdp.pages and "tab-1" not in d.tab_owner
 
 
 def test_sweep_keeps_active_owners_and_forgets_idle_empty_ones():
