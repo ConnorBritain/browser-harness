@@ -128,7 +128,7 @@ LOCAL_HANDSHAKE_TIMEOUT = None
 NO_TOGGLE_GRACE = 3
 TOGGLE_BOOT_GRACE = 12
 OWNER_IDLE = float(os.environ.get("BH_OWNER_IDLE", 1800))  # seconds before an idle owner's tabs are released
-IDLE_EXIT = float(os.environ.get("BH_IDLE_EXIT", 1800))  # seconds before an unused named local or CDP daemon exits
+IDLE_EXIT = float(os.environ.get("BH_IDLE_EXIT", 1800))  # seconds before an unused named local daemon exits (CDP: only if set)
 SWEEP_EVERY = min(60, OWNER_IDLE, IDLE_EXIT)
 MARKS = {"deliverable": "\U0001F4CC", "handoff": "✋"}  # pin: stays for the person; raised hand: person acts now
 
@@ -625,7 +625,8 @@ class Daemon:
 
     async def sweep(self):
         """Release owners idle longer than OWNER_IDLE; forget idle owners with no tabs.
-        Then a named local or CDP daemon exits after IDLE_EXIT without requests. Never the
+        Then an unused named local daemon exits after IDLE_EXIT without requests; a CDP daemon
+        only if BH_IDLE_EXIT is set for it (its starter may come back hours later). Never the
         default local one (Chrome would ask to Allow again), never a Cloud one (exit stops
         the browser), never one a client requires to exist."""
         for key, o in list(self.owners.items()):
@@ -637,7 +638,7 @@ class Daemon:
             async with o.lock:  # never under a command that is attaching or opening a tab
                 if time.time() - o.seen > OWNER_IDLE:  # the owner may have come back meanwhile
                     await self._release(key, o)
-        may_exit = BROWSER_KIND == "cdp" or (BROWSER_KIND == "local" and NAME != "default")
+        may_exit = (BROWSER_KIND == "local" and NAME != "default") or (BROWSER_KIND == "cdp" and "BH_IDLE_EXIT" in os.environ)
         if may_exit and not self.keep and time.time() - self.last > IDLE_EXIT:
             log(f"idle for {IDLE_EXIT:g}s, exiting")
             self.stop.set()

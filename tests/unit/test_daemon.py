@@ -973,13 +973,18 @@ def test_ping_is_not_activity():
     assert d.last > 0
 
 
-@pytest.mark.parametrize(("name", "kind", "required", "exits"), [
-    ("work", "local", False, True), ("default", "cdp", False, True), ("rig", "cdp", False, True),
-    ("default", "local", False, False),  # Chrome would ask to Allow again
-    ("remote", "cloud", False, False),  # exit stops the paid browser and its logins
-    ("rig", "cdp", True, False), ("work", "local", True, False),  # an orchestrator requires it
+@pytest.mark.parametrize(("name", "kind", "required", "opted_in", "exits"), [
+    ("work", "local", False, False, True),
+    ("default", "local", False, True, False),  # Chrome would ask to Allow again
+    ("remote", "cloud", False, True, False),  # exit stops the paid browser and its logins
+    ("rig", "cdp", False, False, False),  # provisioned: its first client may come 31 minutes later
+    ("rig", "cdp", False, True, True), ("default", "cdp", False, True, True),  # only with BH_IDLE_EXIT set
+    ("rig", "cdp", True, True, False), ("work", "local", True, False, False),  # an orchestrator requires it
 ])
-def test_only_unused_named_local_and_cdp_daemons_idle_exit(monkeypatch, name, kind, required, exits):
+def test_only_unused_named_local_daemons_idle_exit_by_default(monkeypatch, name, kind, required, opted_in, exits):
+    monkeypatch.delenv("BH_IDLE_EXIT", raising=False)
+    if opted_in:
+        monkeypatch.setenv("BH_IDLE_EXIT", "1800")
     monkeypatch.setattr(daemon, "NAME", name)
     monkeypatch.setattr(daemon, "BROWSER_KIND", kind)
     monkeypatch.setattr(daemon, "log", lambda _m: None)
