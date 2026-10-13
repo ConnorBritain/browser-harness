@@ -3,7 +3,7 @@
 Core helpers live here. Agent-editable helpers live in
 BH_AGENT_WORKSPACE/agent_helpers.py.
 """
-import base64, importlib.util, json, math, mimetypes, os, re, sys, time, urllib.request
+import base64, importlib.util, json, math, mimetypes, os, sys, time, urllib.request
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -84,12 +84,9 @@ def drain_events():  return _send({"meta": "drain_events"})["events"]
 
 
 def _warn_shared_owner():
-    """Once per session: a sub-agent without BH_OWNER would drive its parent's tabs."""
-    if os.environ.get("BH_OWNER") or os.environ.get("CLAUDE_CODE_CHILD_SESSION") != "1":
-        return
-    flag = ipc._RUNTIME / f"warned-{re.sub(r'[^A-Za-z0-9_-]', '_', OWNER)[:64]}"
-    if not flag.exists():
-        flag.touch()
+    """A sub-agent inherits its parent's session id, so without BH_OWNER it drives its parent's
+    tabs. Said on every call: siblings share the id, so "once" would reach only one of them."""
+    if not os.environ.get("BH_OWNER") and os.environ.get("CLAUDE_CODE_CHILD_SESSION") == "1":
         print("browser-harness: sub-agent without BH_OWNER shares its parent's tabs; prefix commands with BH_OWNER=<name>", file=sys.stderr)
 
 
