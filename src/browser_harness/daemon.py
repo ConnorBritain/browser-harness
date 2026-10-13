@@ -443,6 +443,7 @@ class Daemon:
         self.tab_owner = {}      # target_id -> owner key
         self.session_owner = {}  # session_id -> owner key
         self.info = {}           # target_id -> latest targetInfo
+        self.downloads = {}      # download guid -> owner key, while the download runs
         self.stop = None         # asyncio.Event, set inside start()
         self.last = time.time()  # last request other than ping
         self.keep = os.environ.get("BH_REQUIRE_EXISTING_DAEMON") == "1"  # provisioned: never idle-exit
@@ -457,9 +458,26 @@ class Daemon:
         return f"Your tabs: {tabs or 'none'}."
 
     def _holder(self, tid):
-        """Who holds the tab now. A tab whose owner has been idle for OWNER_IDLE is free to take."""
+        """Who holds the tab now; an iframe or worker counts as its tab. A tab whose owner has
+        been idle for OWNER_IDLE is free to take."""
+        for _ in range(16):  # walk up to the page the target lives in
+            parent = self.info.get(tid, {}).get("parentFrameId")
+            if not parent:
+                break
+            tid = parent
         key = self.tab_owner.get(tid)
         return key if key and time.time() - self.owners[key].seen <= OWNER_IDLE else None
+
+    def _visible(self, key, info):
+        """Target info as this owner may see it: another agent's tab shows no url or title."""
+        if self._holder(info.get("targetId")) in (None, key):
+            return info
+        return {k: v for k, v in info.items() if k not in ("url", "title")}
+
+    def _take(self, key, tid, **how):
+        if self.tab_owner.get(tid, key) != key:
+            self._drop(tid, taken=True)  # its owner went idle; it learns this on its next command
+        self._own(key, tid, **how)
 
     def _taken(self, o, tid):
         return {"error": f"tab-taken: tab {tid} is driven by another agent. Nothing was sent. {self._yours(o)}"}
@@ -644,13 +662,16 @@ class Daemon:
             self.session_owner[params["sessionId"]] = key  # auto-attached iframes and workers
         if method.startswith("Target.") and not session_id:
             return self._target_event(method, params)
-        if session_id and key not in self.owners:  # unknown session, or its owner was forgotten
-            return
-        for o in [self.owners[key]] if key else self.owners.values():
-            o.events.append({"method": method, "params": params, "session_id": session_id})
-        if key is None:
+        if not session_id:  # browser-level, such as downloads: only for the owner of the tab it came from
+            key = self.tab_owner.get(params.get("frameId")) or self.downloads.get(params.get("guid"))
+            if key and "guid" in params:
+                self.downloads[params["guid"]] = key
+                if params.get("state") in ("completed", "canceled"):
+                    del self.downloads[params["guid"]]
+        if key not in self.owners:  # unknown session, or its owner was forgotten
             return
         o = self.owners[key]
+        o.events.append({"method": method, "params": params, "session_id": session_id})
         if method == "Page.javascriptDialogOpening":
             o.dialog = params
         elif method == "Page.javascriptDialogClosed":
@@ -758,7 +779,7 @@ class Daemon:
             return {"dialog": o.dialog}
         if meta == "tabs":
             pages = [t for t in (await self.cdp.send_raw("Target.getTargets"))["targetInfos"] if t["type"] == "page"]
-            return {"tabs": [{**t, "owner": "you" if self.tab_owner.get(t["targetId"]) == key else "taken" if self._holder(t["targetId"]) else None,
+            return {"tabs": [{**self._visible(key, t), "owner": "you" if self.tab_owner.get(t["targetId"]) == key else "taken" if self._holder(t["targetId"]) else None,
                               "mark": o.marks.get(t["targetId"])} for t in pages]}
         if meta == "name_session":
             o.name = re.sub(r"\s+", "-", str(req.get("name") or "").strip())[:16] or None
@@ -805,9 +826,7 @@ class Daemon:
             if req.get("url") and info.get("url") != req["url"]:
                 return {"error": f"tab-changed: tab {tid} now shows {info.get('url')}, not {req['url']}. Nothing was sent. Call list_tabs() and pick again."}
             o.gone = None
-            if self.tab_owner.get(tid, key) != key:
-                self._drop(tid, taken=True)  # its owner went idle; it learns this on its next command
-            self._own(key, tid, current=False)
+            self._take(key, tid, current=False)
             sid = await self._session(key, o, tid)  # the current tab moves only once the new one is attached
             o.current = tid
             self._save()
@@ -840,6 +859,12 @@ class Daemon:
             result = await self.cdp.send_raw(method, params)
             if method == "Target.attachToTarget":
                 self.session_owner.setdefault(result["sessionId"], key)
+                if self.info.get(params.get("targetId"), {}).get("type") == "page":
+                    self._take(key, params["targetId"], current=False)  # a raw attach takes the tab like switch_tab
+            elif method == "Target.getTargets":
+                result = {**result, "targetInfos": [self._visible(key, t) for t in result.get("targetInfos", [])]}
+            elif method == "Target.getTargetInfo":
+                result = {**result, "targetInfo": self._visible(key, result.get("targetInfo", {}))}
             return {"result": result}
         if sid:  # an explicit session gets exactly that session, never a redirect
             if self.session_owner.get(sid, key) != key:
