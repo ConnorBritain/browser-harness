@@ -30,7 +30,7 @@ PROTOCOL = 2
 
 
 def owner():
-    """Which agent is calling: BH_OWNER, else the Claude Code session or Codex thread, else default.
+    """Which agent is calling: BH_OWNER, else the host agent's session id, else default.
     Sub-agents inherit their parent's session id, so they need their own BH_OWNER."""
     return os.environ.get("BH_OWNER") or os.environ.get("CLAUDE_CODE_SESSION_ID") or os.environ.get("CODEX_THREAD_ID") or "default"
 
