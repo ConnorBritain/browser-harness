@@ -469,9 +469,18 @@ def ensure_real_tab():
     return current_tab()
 
 def iframe_target(url_substr):
-    """First iframe target whose URL contains `url_substr`. Use with js(..., target_id=...)."""
-    for t in cdp("Target.getTargets")["targetInfos"]:
-        if t["type"] == "iframe" and url_substr in t.get("url", ""):
+    """First cross-origin iframe inside your current tab whose URL contains `url_substr`.
+    Use with js(..., target_id=...). Never an iframe of another tab."""
+    mine, todo = set(), [cdp("Page.getFrameTree")["frameTree"]]
+    while todo:
+        node = todo.pop()
+        mine.add(node["frame"]["id"])
+        todo += node.get("childFrames", [])
+    frames = [t for t in cdp("Target.getTargets")["targetInfos"] if t["type"] == "iframe"]
+    for _ in frames:  # an iframe target whose parent frame is mine is mine too, however deep
+        mine |= {t["targetId"] for t in frames if t.get("parentFrameId") in mine}
+    for t in frames:
+        if t["targetId"] in mine and url_substr in t.get("url", ""):
             return t["targetId"]
     return None
 

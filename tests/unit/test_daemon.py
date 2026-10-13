@@ -317,6 +317,36 @@ def test_raw_attach_session_belongs_to_its_owner():
     assert b["error"].startswith("tab-taken:")
 
 
+def test_another_agents_tab_shows_no_url_or_title_even_to_raw_cdp():
+    """Review S7: hiding was client-side only."""
+    d = _daemon(PERSON)
+    _run(d, cmd("a"), cmd("b"))
+    d.cdp.pages["tab-3"] = "https://secret.example/token=abc"
+    d.info["frame"] = {"targetId": "frame", "type": "iframe", "url": "https://secret.example/pay", "parentFrameId": "tab-3"}
+
+    tabs, targets, info, own = _run(d, meta("a", "tabs"), cmd("a", "Target.getTargets"),
+                                    cmd("a", "Target.getTargetInfo", targetId="tab-3"), cmd("b", "Target.getTargetInfo", targetId="tab-3"))
+
+    assert "secret" not in json.dumps([tabs, targets, info]) and "secret" in json.dumps(own)
+    assert {t["targetId"]: t.get("url") for t in tabs["tabs"]} == {"person-tab": "https://mail.example/", "tab-1": "about:blank", "tab-3": None}
+    assert d._visible("a", d.info["frame"]) == {"targetId": "frame", "type": "iframe", "parentFrameId": "tab-3"}
+
+
+def test_raw_attach_to_a_free_tab_takes_it():
+    """Review S7: A raw-attached the person's tab, B took it with switch_tab, A kept driving it."""
+    d = _daemon(PERSON, ("frame", "https://ads.example/"))
+    d.info["frame"]["type"] = "iframe"
+
+    attached, b_switch, b_attach, b_frame = _run(
+        d, cmd("a", "Target.attachToTarget", targetId="person-tab", flatten=True), meta("b", "switch_tab", target_id="person-tab"),
+        cmd("b", "Target.attachToTarget", targetId="person-tab", flatten=True), cmd("b", "Target.attachToTarget", targetId="frame", flatten=True))
+
+    assert "sessionId" in attached["result"] and d.tab_owner == {"person-tab": "a"}
+    assert d.owners["a"].current is None  # taken, but not made current
+    assert b_switch["error"].startswith("tab-taken:") and b_attach["error"].startswith("tab-taken:")
+    assert "sessionId" in b_frame["result"] and "frame" not in d.tab_owner  # a target that is no tab has no owner
+
+
 def test_close_tab_closes_only_your_tabs():
     d = _daemon(PERSON)
     _run(d, cmd("a"))
@@ -404,13 +434,15 @@ def test_events_and_dialogs_belong_to_their_owner():
 
     d._record_event("Network.requestWillBeSent", {"requestId": "1"}, sa)
     d._record_event("Page.javascriptDialogOpening", {"message": "hi"}, sb)
-    d._record_event("Browser.downloadProgress", {"guid": "g"})
+    d._record_event("Browser.downloadWillBegin", {"frameId": "tab-1", "guid": "g", "url": "https://a.example/report.pdf"})
+    d._record_event("Browser.downloadProgress", {"guid": "g", "state": "completed"})
+    d._record_event("Browser.downloadProgress", {"guid": "someone-elses", "state": "inProgress"})
     d._record_event("Network.requestWillBeSent", {"requestId": "2"}, "unknown-session")
 
     ea, eb, da, db = _run(d, meta("a", "drain_events"), meta("b", "drain_events"),
                           meta("a", "pending_dialog"), meta("b", "pending_dialog"))
-    assert [e["method"] for e in ea["events"]] == ["Network.requestWillBeSent", "Browser.downloadProgress"]
-    assert [e["method"] for e in eb["events"]] == ["Page.javascriptDialogOpening", "Browser.downloadProgress"]
+    assert [e["method"] for e in ea["events"]] == ["Network.requestWillBeSent", "Browser.downloadWillBegin", "Browser.downloadProgress"]
+    assert [e["method"] for e in eb["events"]] == ["Page.javascriptDialogOpening"] and d.downloads == {}
     assert da == {"dialog": None} and db == {"dialog": {"message": "hi"}}
 
 
@@ -477,6 +509,7 @@ def test_event_errors_never_reach_the_websocket_reader(monkeypatch):
     logged = []
     monkeypatch.setattr(daemon, "log", logged.append)
     d = _daemon(("frame", "https://ads.example/"))
+    d.info["frame"]["type"] = "iframe"
     r, _ = _run(d, cmd("a", "Target.attachToTarget", targetId="frame", flatten=True), cmd("b"))
     d.owners["a"].seen = 0
     asyncio.run(d.sweep())  # a is idle and holds nothing: forgotten, but its raw session lives on
