@@ -846,6 +846,16 @@ def test_ping_reports_protocol_and_other_active_owners():
     assert (me["active"], other["active"]) == (0, 1)  # b idle, c holds no tab
 
 
+def test_another_agents_probe_does_not_keep_the_default_owner_active():
+    d = _daemon()
+    _run(d, {"method": "Input.insertText", "params": {"text": "x"}})  # a client without owner opened a tab
+    d.owners["default"].seen = 0
+
+    _, ping = _run(d, {"method": "Target.getTargets", "params": {}, "owner": "agent-7"}, {"meta": "ping", "owner": "agent-7"})
+
+    assert ping["active"] == 0 and d.owners["default"].seen == 0
+
+
 def test_ping_is_not_activity():
     d = _daemon()
     d.last = 0

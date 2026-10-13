@@ -163,6 +163,21 @@ def test_update_banner_remains_enabled_by_default(monkeypatch):
     assert called == [True]
 
 
+def test_health_probes_carry_the_callers_owner(monkeypatch):
+    """Review S4: an ownerless probe landed on owner "default" and kept it active forever."""
+    seen = []
+    monkeypatch.setenv("BH_OWNER", "agent-7")
+    monkeypatch.setattr(admin, "daemon_alive", lambda _name=None: True)
+    monkeypatch.setattr(admin.ipc, "connect", lambda _name, timeout: (FakeSocket(), None))
+    monkeypatch.setattr(admin.ipc, "request", lambda _s, _t, req: seen.append(req) or {"result": {}, "page": None})
+
+    admin.ensure_daemon(name="rig")
+    admin.require_existing_daemon("rig")
+    admin.daemon_browser_ready("rig")
+
+    assert seen and all(req["owner"] == "agent-7" for req in seen)
+
+
 def test_local_chrome_mode_is_false_when_env_provides_remote_cdp():
     assert not admin._is_local_chrome_mode({"BU_CDP_WS": "ws://example.test/devtools/browser/1"})
 
