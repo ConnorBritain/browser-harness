@@ -542,7 +542,9 @@ class Daemon:
                         self._own(key, tid, current=tid == saved.get("current"), created=tid in saved.get("created", []))
                         if saved.get("marks", {}).get(tid) in MARKS:
                             o.marks[tid] = saved["marks"][tid]
-        except Exception as e:  # a missing or damaged file must never keep the daemon from starting
+        except FileNotFoundError:
+            pass
+        except Exception as e:  # a damaged file must never keep the daemon from starting
             log(f"load owners: {e!r}")
 
     async def _current(self, key, o):
