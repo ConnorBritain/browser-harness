@@ -216,10 +216,14 @@ def test_daemon_must_drive_the_browser_the_env_points_at(monkeypatch, have, mism
 @pytest.mark.parametrize(("ping", "outcome"), [
     ({"pong": True, "protocol": admin.ipc.PROTOCOL, "active": 3}, "kept"),
     ({}, "kept"),  # no answer is no reason to drop a healthy connection
-    ({"pong": True}, "restarted"),  # protocol 1 daemon, nobody else on it
-    ({"pong": True, "protocol": admin.ipc.PROTOCOL + 1, "active": 0}, "restarted"),
-    ({"pong": True, "protocol": 1, "active": 2}, "other agents are using it"),
+    ({"pong": True, "browser_kind": "local"}, "restarted"),  # protocol 1 local daemon, nobody else on it
+    ({"pong": True, "protocol": 1, "active": 2, "browser_kind": "local"}, "other agents are using it"),
     ({"pong": True, "protocol": 1, "active": 0, "browser_kind": "cloud"}, "its Cloud browser would stop"),
+    # S5b: restarted from this shell, a CDP daemon would come back on the person's local Chrome
+    ({"pong": True, "protocol": 1, "active": 0, "browser_kind": "cdp"}, "only its starter knows which browser it drives"),
+    ({"pong": True, "protocol": 1, "active": 0}, "only its starter knows which browser it drives"),
+    # S5a: an older client never stops a newer daemon; two installs would flap it, one Allow each time
+    ({"pong": True, "protocol": admin.ipc.PROTOCOL + 1, "active": 0, "browser_kind": "local"}, "it is newer than this client"),
 ])
 def test_only_an_idle_daemon_on_another_protocol_restarts(monkeypatch, ping, outcome):
     restarted = []
@@ -230,9 +234,10 @@ def test_only_an_idle_daemon_on_another_protocol_restarts(monkeypatch, ping, out
         assert admin._restart_if_outdated("rig") is (outcome == "restarted")
         assert restarted == (["rig"] if outcome == "restarted" else [])
     else:
-        with pytest.raises(RuntimeError, match=f"daemon-outdated: .*not restarted because {outcome}"):
+        with pytest.raises(RuntimeError, match=f"daemon-outdated: .*not restarted because {outcome}") as e:
             admin._restart_if_outdated("rig")
         assert restarted == []
+        assert ("Update browser-harness" in str(e.value)) is (outcome == "it is newer than this client")
 
 
 def test_a_required_daemon_on_another_protocol_is_never_restarted(monkeypatch):

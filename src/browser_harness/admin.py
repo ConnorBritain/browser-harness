@@ -397,24 +397,28 @@ def daemon_browser_kind(name=None):
 
 
 def _restart_if_outdated(name=None, may_restart=True):
-    """A daemon on another protocol is stopped only when no other agent uses it and it
-    holds no Cloud browser; a newer client on the same protocol just uses it."""
+    """A client on the same protocol just uses the daemon. An older daemon is stopped only
+    when it is a local-Chrome one nobody else uses: a CDP or Cloud daemon would come back
+    on this caller's browser, not its own. A newer daemon is never stopped by an older client."""
     ping = _ping(name)
-    have = ping.get("protocol", 1)
+    have, kind = ping.get("protocol", 1), ping.get("browser_kind")
     if not ping.get("pong") or have == ipc.PROTOCOL:  # an unanswered ping is no reason to drop a healthy connection
         return False
-    if not may_restart:
-        why = "it must stay as provisioned"
-    elif ping.get("browser_kind") == "cloud":
-        why = "its Cloud browser would stop"
+    if have > ipc.PROTOCOL:
+        why, fix = "it is newer than this client", "Update browser-harness (browser-harness --update)."
+    elif not may_restart:
+        why, fix = "it must stay as provisioned", "Have its orchestrator restart it."
+    elif kind != "local":
+        why = "its Cloud browser would stop" if kind == "cloud" else "only its starter knows which browser it drives"
+        fix = "Stop it with browser-harness --reload and start it again the way it was started."
     elif ping.get("active"):
-        why = "other agents are using it"
+        why, fix = "other agents are using it", "Retry when they finish, or run browser-harness --reload."
     else:
         restart_daemon(name)
         return True
     raise RuntimeError(
         f"daemon-outdated: daemon {name or NAME!r} speaks protocol {have}, this client {ipc.PROTOCOL}. "
-        f"It was not restarted because {why}. Nothing was sent. Retry when they finish, or run browser-harness --reload."
+        f"It was not restarted because {why}. Nothing was sent. {fix}"
     )
 
 
