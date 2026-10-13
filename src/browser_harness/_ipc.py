@@ -70,7 +70,7 @@ def endpoint_label(env=os.environ):
     if not url: return "local"
     from urllib.parse import urlparse
     p = urlparse(url)
-    return f"{p.hostname}:{p.port or ''}"
+    return f"{'127.0.0.1' if p.hostname == 'localhost' else p.hostname}:{p.port or ''}"
 
 
 def _read_port_file(name):
