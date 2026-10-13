@@ -678,7 +678,7 @@ def test_idle_release_gives_tabs_back_and_closes_nothing(monkeypatch):
 
     assert sorted(d.cdp.pages) == ["person-2", "person-tab", "tab-1", "tab-3", "tab-7"]
     assert d.cdp.sent("Target.closeTarget") == []
-    assert d.tab_owner == {"tab-3": "a", "person-2": "a", "tab-7": "a"}
+    assert d.tab_owner == {"tab-7": "a"}
     assert d.owners["a"].current == "tab-7" and d.owners["a"].tabs["tab-7"] == current_session
     assert sorted(t for p, t in _titles(d) if p == "") == ["person-tab", "tab-1"]
     assert sorted(d.cdp.tab_of(p["sessionId"]) for m, p, _s in d.cdp.calls if m == "Target.detachFromTarget") == ["person-2", "person-tab", "tab-1", "tab-3"]
@@ -695,6 +695,23 @@ def test_idle_release_closes_opened_tabs_only_when_asked(monkeypatch):
 
     assert [p["targetId"] for m, p, _s in d.cdp.calls if m == "Target.closeTarget"] == ["tab-1"]
     assert sorted(d.cdp.pages) == ["person-2", "person-tab", "tab-3", "tab-7"]
+
+
+def test_an_idle_owners_tab_can_be_taken_and_it_learns_tab_released():
+    """Review S8: a finished agent's marked tab must not stay taken forever."""
+    d = _daemon(PERSON)
+    _run(d, cmd("a"), meta("a", "mark_tab", mark="deliverable"), cmd("b"))
+    busy, _ = _run(d, meta("b", "switch_tab", target_id="tab-1"), meta("b", "tabs"))
+    d.owners["a"].seen = 0
+    asyncio.run(d.sweep())
+
+    listed, taken, back, after = _run(d, meta("b", "tabs"), meta("b", "switch_tab", target_id="tab-1"), cmd("a"), cmd("a"))
+
+    assert busy["error"].startswith("tab-taken:")
+    assert {t["targetId"]: t["owner"] for t in listed["tabs"]}["tab-1"] is None
+    assert taken["target_id"] == "tab-1" and d.tab_owner["tab-1"] == "b"
+    assert back["error"].startswith("tab-released: your tab tab-1 was taken by another agent while you were idle.")
+    assert after == {"result": {}} and d.owners["a"].current not in (None, "tab-1")
 
 
 def test_after_idle_the_next_command_still_goes_to_the_same_tab():
