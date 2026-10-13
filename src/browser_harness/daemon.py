@@ -127,7 +127,8 @@ TOGGLE_BOOT_GRACE = 12
 # Cancellation should make an in-flight CDP call finish immediately. Keep the
 # drain bounded anyway so shutdown fails closed if a client ignores cancellation.
 RECOVERY_CANCEL_DRAIN_TIMEOUT = 2
-TAB_MARKER_JS = "if(!document.title.startsWith('\U0001F434'))document.title='\U0001F434 '+document.title"
+TAB_CLOSED = "tab-closed: your tab was closed. Nothing was sent. Call new_tab(url)."
+TAB_MARKER_JS ="if(!document.title.startsWith('\U0001F434'))document.title='\U0001F434 '+document.title"
 
 
 def tab_marker_enabled():
@@ -562,6 +563,17 @@ class Daemon:
                 log(f"enable {d} on {session_id}: {e}")
         await asyncio.gather(*(enable_one(d) for d in ("Page", "DOM", "Runtime", "Network")))
 
+    async def _reattach_same_tab(self, stale_session):
+        """A stale session reattaches its own tab, never another one."""
+        targets = (await self.cdp.send_raw("Target.getTargets"))["targetInfos"]
+        if not any(t["targetId"] == self.target_id for t in targets):
+            return None
+        self.session = (await self.cdp.send_raw(
+            "Target.attachToTarget", {"targetId": self.target_id, "flatten": True}
+        ))["sessionId"]
+        self._record_session_replacement(stale_session, self.session)
+        return self.session
+
     def _record_session_replacement(self, stale_session, replacement_session):
         """Remember which recovered session still controls the same tab."""
         if not stale_session or not replacement_session or stale_session == replacement_session:
@@ -784,11 +796,9 @@ class Daemon:
                             return {"error": "daemon is shutting down"}
                         replacement_session = self._session_replacements.get(sid)
                         if replacement_session is None and sid == self.session:
-                            log(f"stale session {sid}, re-attaching")
-                            if not await self.attach_first_page(
-                                replaces_session=sid, enable_domains=False
-                            ):
-                                return {"error": msg}
+                            log(f"stale session {sid}, re-attaching {self.target_id}")
+                            if not await self._reattach_same_tab(sid):
+                                return {"error": TAB_CLOSED}
                             replacement_session = self._session_replacements.get(sid)
                             recovered_here = replacement_session is not None
                     if recovered_here:

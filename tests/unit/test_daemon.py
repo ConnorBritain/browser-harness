@@ -845,3 +845,41 @@ def test_explicit_stale_session_is_not_redirected():
     assert d.cdp.calls == [
         ("Runtime.evaluate", {"expression": "1"}, "explicit-stale-session")
     ]
+
+
+class _StaleCDP(_AttachCDP):
+    async def send_raw(self, method, params=None, session_id=None):
+        if session_id == "stale-session":
+            self.calls.append((method, params, session_id))
+            raise RuntimeError("Session with given id not found")
+        return await super().send_raw(method, params, session_id)
+
+
+def test_stale_session_never_replays_onto_another_tab(monkeypatch):
+    """S1: the agent's tab is gone; the person's tab must not receive the command."""
+    monkeypatch.setattr(daemon, "NAME", "default")
+    d = daemon.Daemon()
+    d.cdp = _StaleCDP([{"targetId": "person-tab", "url": "https://mail.example/", "type": "page"}])
+    d.session, d.target_id = "stale-session", "agent-tab"
+
+    result = asyncio.run(d.handle({"method": "Input.insertText", "params": {"text": "x"}}))
+
+    assert result["error"].startswith("tab-closed:")
+    assert [c for c in d.cdp.calls if c[0] == "Target.attachToTarget"] == []
+    assert [s for m, _p, s in d.cdp.calls if m == "Input.insertText"] == ["stale-session"]
+
+
+def test_stale_session_reattaches_the_same_tab_once(monkeypatch):
+    monkeypatch.setattr(daemon, "NAME", "default")
+    d = daemon.Daemon()
+    d.cdp = _StaleCDP([
+        {"targetId": "person-tab", "url": "https://mail.example/", "type": "page"},
+        {"targetId": "agent-tab", "url": "https://shop.example/", "type": "page"},
+    ])
+    d.session, d.target_id = "stale-session", "agent-tab"
+
+    result = asyncio.run(d.handle({"method": "Input.insertText", "params": {"text": "x"}}))
+
+    assert result == {"result": {}}
+    assert [p for m, p, _s in d.cdp.calls if m == "Target.attachToTarget"] == [{"targetId": "agent-tab", "flatten": True}]
+    assert [s for m, _p, s in d.cdp.calls if m == "Input.insertText"] == ["stale-session", "session-for-agent-tab"]
