@@ -5,14 +5,19 @@ Use **CDP for control**, **UI automation for user-visible order**.
 ## Pure CDP (portable: macOS / Linux / Windows)
 
 ```python
-tabs = list_tabs()                    # includes chrome:// pages too
+tabs = list_tabs()                    # includes chrome:// pages too; each has an owner
 real_tabs = list_tabs(include_chrome=False)
-tid = new_tab("https://example.com")  # create + attach in the background
-switch_tab(tid)                       # attach harness, move the horse marker
+tid = new_tab("https://example.com")  # your new background tab, now current
+switch_tab(tabs[0])                   # take a tab (fails: tab-taken, tab-changed)
 activate_tab(tid)                     # optional: explicitly show it in Chrome
+mark_tab(tid, "deliverable")          # keep it open for the person when you finish
+close_tab(tid)                        # only your own tabs
 print(current_tab())
 print(page_info())
 ```
+
+Owners: `"you"`, `None` (the person's, free to take) or `"taken"` (another
+agent's; no title or url, and every command on it fails with `tab-taken`).
 
 What CDP is good at:
 - attach to a tab
