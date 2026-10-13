@@ -530,21 +530,22 @@ class Daemon:
     async def _session(self, key, o, tid):
         """The owner's session on its tab, attached once on first use. A gone tab raises tab-closed."""
         async with o.lock:
-            if tid in o.tabs and o.tabs[tid] is None:
+            sid = o.tabs.get(tid)
+            if tid in o.tabs and sid is None:
                 try:
                     sid = (await self.cdp.send_raw("Target.attachToTarget", {"targetId": tid, "flatten": True}))["sessionId"]
                 except RuntimeError as e:
                     if "No target with given id" not in str(e):
                         raise
                     self._drop(tid)  # closed after it was taken, before first use
-                else:
+                if tid in o.tabs:  # not closed while attaching
                     o.tabs[tid], self.session_owner[sid] = sid, key
                     await self._enable_default_domains(sid)
                     self._mark(key, tid)
             if tid not in o.tabs:
                 o.gone = None
                 raise RuntimeError(self._closed(o, tid))
-            return o.tabs[tid]
+            return sid  # never None: a command without a session would run at browser level
 
     def _mark(self, key, tid, prefix=None):
         """Show in the tab title which agent holds it and its mark, off the synchronous IPC path."""

@@ -253,6 +253,27 @@ def test_tab_closed_during_a_switch_is_tab_closed_and_keeps_your_current_tab():
     assert after == {"result": {}} and d.tab_owner == {"tab-1": "b"}
 
 
+def test_tab_closed_right_after_attach_is_tab_closed_not_a_zombie():
+    """Attach reply and targetDestroyed arrive in one read (an OAuth popup closing itself)."""
+    d = _daemon(("popup", "https://login.example/"))
+    _run(d, cmd("a"))
+    real = d.cdp.send_raw
+
+    async def attach_then_destroy(method, params=None, session_id=None):
+        r = await real(method, params, session_id)
+        if method == "Target.attachToTarget" and params["targetId"] == "popup":
+            d.cdp.pages.pop("popup")
+            d._record_event("Target.targetDestroyed", {"targetId": "popup"})
+        return r
+    d.cdp.send_raw = attach_then_destroy
+
+    switched, after = _run(d, meta("a", "switch_tab", target_id="popup"), cmd("a", "Storage.clearCookies"))
+
+    assert switched["error"].startswith("tab-closed: your tab popup")
+    assert d.owners["a"].tabs.keys() == {"tab-1"} and d.owners["a"].current == "tab-1"
+    assert [d.cdp.tab_of(s) for s in d.cdp.sent("Storage.clearCookies")] == ["tab-1"]
+
+
 def test_switch_tab_with_a_moved_url_is_tab_changed():
     d = _daemon(PERSON)
 
