@@ -738,3 +738,33 @@ def test_js_keeps_base_exception_from_evaluation_when_detach_also_raises():
         KeyboardInterrupt, match="evaluation interrupted"
     ):
         helpers.js("7", target_id="iframe-target")
+
+
+def _wait_for_load(state, events=lambda now: [], timeout=8.0):
+    """Fake clock that only moves on sleep. state(now) -> readyState; events(now) -> [(session_id, method)].
+    Returns (result, seconds waited)."""
+    clock = [0.0]
+    with patch("browser_harness.helpers._send", return_value={"session_id": "s1"}), \
+         patch("browser_harness.helpers.drain_events", side_effect=lambda: [{"session_id": s, "method": m} for s, m in events(clock[0])]), \
+         patch("browser_harness.helpers.js", side_effect=lambda _: state(clock[0])), \
+         patch("browser_harness.helpers.time.time", side_effect=lambda: clock[0]), \
+         patch("browser_harness.helpers.time.sleep", side_effect=lambda s: clock.__setitem__(0, clock[0] + s)):
+        return helpers.wait_for_load(timeout=timeout), round(clock[0], 1)
+
+
+def test_wait_for_load_returns_on_complete():
+    assert _wait_for_load(lambda now: "complete" if now >= 0.6 else "loading") == (True, 0.6)
+
+
+def test_wait_for_load_returns_when_interactive_and_the_network_is_quiet():
+    assert _wait_for_load(lambda now: "interactive") == (True, 0.6)
+
+
+def test_wait_for_load_waits_while_its_own_tab_has_network_events():
+    busy = lambda now: [("s1", "Network.dataReceived")] if now < 2 else [("s2", "Network.dataReceived")]
+    # Last own event at 1.8 s; quiet for 500 ms by the poll at 2.4 s. The other tab's events do not count.
+    assert _wait_for_load(lambda now: "interactive", busy) == (True, 2.4)
+
+
+def test_wait_for_load_gives_up_at_the_timeout():
+    assert _wait_for_load(lambda now: "loading") == (False, 8.1)
