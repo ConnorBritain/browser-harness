@@ -138,8 +138,8 @@ def cmd(owner, method="Input.insertText", **params):
     return {"owner": owner, "method": method, "params": params or {"text": "x"}}
 
 
-def meta(owner, name, **fields):
-    return {"owner": owner, "meta": name, **fields}
+def meta(owner, kind, **fields):
+    return {"owner": owner, "meta": kind, **fields}
 
 
 PERSON = ("person-tab", "https://mail.example/")
@@ -280,7 +280,7 @@ def test_close_tab_closes_only_your_tabs():
                               meta("a", "close_tab"))
 
     assert other["error"].startswith("tab-taken:")
-    assert person["error"] == "close_tab: tab person-tab is not yours; switch_tab() to it first"
+    assert person["error"] == "tab person-tab is not yours; switch_tab() to it first"
     assert own == {"closed": "tab-1"}
     assert list(d.cdp.pages) == ["person-tab"]
 
@@ -511,33 +511,122 @@ def test_explicit_stale_session_is_not_redirected():
 
 # --- tab marker and domains ---
 
+def _titles(d):
+    """Title prefixes the daemon wrote, in order, as (prefix, tab)."""
+    return [(json.loads(p["expression"].rsplit("(", 1)[1].rstrip(")")), d.cdp.tab_of(s))
+            for m, p, s in d.cdp.calls if m == "Runtime.evaluate"]
+
+
+def _settle(d, *reqs, events=()):
+    async def go():
+        out = [await d.handle(r) for r in reqs]
+        for e in events:
+            d._record_event(*e)
+        for _ in range(3):
+            await asyncio.sleep(0)
+        return out
+    return asyncio.run(go())
+
+
 @pytest.mark.parametrize("value", ["0", "false", "NO", "off"])
 def test_tab_marker_can_be_disabled(monkeypatch, value):
     monkeypatch.setenv("BH_TAB_MARKER", value)
     d = _daemon()
+    _run(d, cmd("a"))
 
-    async def go():
-        await d.handle(cmd("a"))
-        d._record_event("Page.loadEventFired", {}, d.owners["a"].tabs["tab-1"])
-        await asyncio.sleep(0)
-    asyncio.run(go())
+    _settle(d, meta("a", "name_session", name="x"), meta("a", "mark_tab", mark="handoff"),
+            events=[("Page.loadEventFired", {}, d.owners["a"].tabs["tab-1"])])
 
     assert d.cdp.sent("Runtime.evaluate") == []
 
 
-def test_tab_marker_marks_owned_tabs_on_attach_and_load(monkeypatch):
+def test_tab_title_shows_owner_and_mark_on_attach_load_name_and_mark(monkeypatch):
+    monkeypatch.delenv("BH_TAB_MARKER", raising=False)
+    d = _daemon()
+    _settle(d, cmd("agent-7"))
+    sid = d.owners["agent-7"].tabs["tab-1"]
+
+    _settle(d, meta("agent-7", "name_session", name="checkout bot"), meta("agent-7", "mark_tab", mark="handoff"),
+            events=[("Page.loadEventFired", {}, sid), ("Page.loadEventFired", {}, "someone-elses-session")])
+
+    assert _titles(d) == [("\U0001F434agent7 ", "tab-1"), ("\U0001F434checkout-bot ", "tab-1"),
+                          ("\U0001F434checkout-bot✋ ", "tab-1"), ("\U0001F434checkout-bot✋ ", "tab-1")]
+
+
+def test_default_owner_keeps_the_plain_horse(monkeypatch):
     monkeypatch.delenv("BH_TAB_MARKER", raising=False)
     d = _daemon()
 
-    async def go():
-        await d.handle(cmd("a"))
-        d._record_event("Page.loadEventFired", {}, d.owners["a"].tabs["tab-1"])
-        d._record_event("Page.loadEventFired", {}, "someone-elses-session")
-        await asyncio.sleep(0)
-    asyncio.run(go())
+    _settle(d, cmd("default"))
 
-    sid = d.owners["a"].tabs["tab-1"]
-    assert [(p["expression"], s) for m, p, s in d.cdp.calls if m == "Runtime.evaluate"] == [(daemon.TAB_MARKER_JS, sid)] * 2
+    assert _titles(d) == [("\U0001F434 ", "tab-1")]
+
+
+def test_tab_marker_js_replaces_any_earlier_marker():
+    js = daemon.tab_marker_js("\U0001F434b\U0001F4CC ")
+    assert js.startswith("(p=>{const t=document.title.replace(/^\\u{1F434}\\S* /u,'');")
+    assert js.endswith('("\\ud83d\\udc34b\\ud83d\\udccc ")')
+
+
+def test_mark_tab_only_marks_your_tabs_with_a_known_mark():
+    d = _daemon(PERSON)
+    _run(d, cmd("a"), cmd("b"))
+
+    ok, taken, free, bad, tabs, cleared = _run(
+        d, meta("a", "mark_tab", target_id="tab-1", mark="deliverable"), meta("a", "mark_tab", target_id="tab-3", mark="handoff"),
+        meta("a", "mark_tab", target_id="person-tab", mark="handoff"), meta("a", "mark_tab", mark="keep"),
+        meta("a", "tabs"), meta("b", "mark_tab", mark=None))
+
+    assert ok == {"target_id": "tab-1", "mark": "deliverable"}
+    assert taken["error"].startswith("tab-taken:")
+    assert free["error"] == "tab person-tab is not yours; switch_tab() to it first"
+    assert bad["error"].startswith("mark_tab: mark must be one of ['deliverable', 'handoff']")
+    assert {t["targetId"]: t["mark"] for t in tabs["tabs"]} == {"person-tab": None, "tab-1": "deliverable", "tab-3": None}
+    assert cleared == {"target_id": "tab-3", "mark": None} and d.owners["a"].marks == {"tab-1": "deliverable"}
+
+
+def test_idle_owner_release(monkeypatch):
+    """Marked tabs stay open and owned, unmarked tabs it opened close,
+    unmarked tabs it took go back to the person with a clean title."""
+    monkeypatch.delenv("BH_TAB_MARKER", raising=False)
+    d = _daemon(PERSON, ("person-2", "https://docs.example/"))
+    _run(d, cmd("a"), meta("a", "new_tab"), meta("a", "mark_tab", mark="deliverable"),
+         meta("a", "switch_tab", target_id="person-2"), meta("a", "mark_tab", mark="handoff"),
+         meta("a", "switch_tab", target_id="person-tab"), meta("a", "new_tab"))
+    d.owners["a"].seen = 0
+    d.cdp.calls.clear()
+
+    asyncio.run(d.sweep())
+
+    assert sorted(d.cdp.pages) == ["person-2", "person-tab", "tab-3"]  # tab-1 and tab-7 closed
+    assert d.tab_owner == {"tab-3": "a", "person-2": "a"}
+    assert d.owners["a"].tabs == {"tab-3": None, "person-2": None} and d.owners["a"].current is None
+    assert ("\U0001F434", "person-tab") not in _titles(d) and ("", "person-tab") in _titles(d)
+    assert sorted(d.cdp.tab_of(p["sessionId"]) for m, p, _s in d.cdp.calls if m == "Target.detachFromTarget") == ["person-2", "person-tab", "tab-3"]
+    d.cdp.calls.clear()
+    asyncio.run(d.sweep())
+    assert d.cdp.calls == []  # nothing left to release
+
+
+def test_idle_release_never_closes_the_browsers_last_tab():
+    d = _daemon()
+    _run(d, cmd("a"))
+    d.info = {t: d.cdp.info(t) for t in d.cdp.pages}
+    d.owners["a"].seen = 0
+
+    asyncio.run(d.sweep())
+
+    assert list(d.cdp.pages) == ["tab-1"] and d.tab_owner == {}
+
+
+def test_sweep_keeps_active_owners_and_forgets_idle_empty_ones():
+    d = _daemon()
+    _run(d, cmd("a"), meta("b", "tabs"))
+    d.owners["b"].seen = 0
+
+    asyncio.run(d.sweep())
+
+    assert list(d.owners) == ["a"] and d.tab_owner == {"tab-1": "a"}
 
 
 def test_enable_default_domains_runs_four_enables_in_parallel():
@@ -592,7 +681,8 @@ def test_close_inspect_tabs_only_when_the_harness_opened_one(monkeypatch, tmp_pa
 
 def test_owner_tabs_survive_a_daemon_restart():
     d = _daemon(PERSON)
-    _run(d, cmd("a"), cmd("b"), meta("a", "switch_tab", target_id="person-tab"))
+    _run(d, cmd("a"), cmd("b"), meta("a", "switch_tab", target_id="person-tab"),
+         meta("a", "mark_tab", mark="handoff"), meta("a", "name_session", name="shop"))
     d.cdp.pages.pop("tab-3")  # b's tab closed while the daemon was down
 
     again = daemon.Daemon()
@@ -602,6 +692,7 @@ def test_owner_tabs_survive_a_daemon_restart():
 
     assert again.owners["a"].current == "person-tab"
     assert set(again.owners["a"].tabs) == {"tab-1", "person-tab"}
+    assert (again.owners["a"].name, again.owners["a"].marks, again.owners["a"].created) == ("shop", {"person-tab": "handoff"}, {"tab-1"})
     assert [d.cdp.tab_of(s) for s in d.cdp.sent("Input.insertText")][-2:] == ["person-tab", "tab-7"]
 
 

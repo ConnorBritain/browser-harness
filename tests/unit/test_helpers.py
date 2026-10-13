@@ -460,15 +460,27 @@ def test_new_tab_reuses_an_empty_tab_only_for_a_url(monkeypatch):
 
 def test_list_tabs_hides_other_agents_tabs(monkeypatch):
     _daemon_replies(monkeypatch, {"tabs": [
-        {"targetId": "mine", "title": "Mine", "url": "https://a.example/", "owner": "you"},
-        {"targetId": "theirs", "title": "Secret", "url": "https://b.example/", "owner": "taken"},
-        {"targetId": "persons", "title": "Mail", "url": "chrome://settings", "owner": None},
+        {"targetId": "mine", "title": "Mine", "url": "https://a.example/", "owner": "you", "mark": "handoff"},
+        {"targetId": "theirs", "title": "Secret", "url": "https://b.example/", "owner": "taken", "mark": None},
+        {"targetId": "persons", "title": "Mail", "url": "chrome://settings", "owner": None, "mark": None},
     ]})
 
     assert helpers.list_tabs(include_chrome=False) == [
-        {"targetId": "mine", "target_id": "mine", "owner": "you", "title": "Mine", "url": "https://a.example/"},
+        {"targetId": "mine", "target_id": "mine", "owner": "you", "title": "Mine", "url": "https://a.example/", "mark": "handoff"},
         {"targetId": "theirs", "target_id": "theirs", "owner": "taken"},
     ]
+
+
+def test_mark_tab_and_name_session_are_daemon_commands(monkeypatch):
+    sent = _daemon_replies(monkeypatch, {"mark": "deliverable", "name": "shop"})
+
+    helpers.mark_tab({"targetId": "t1"}, "deliverable")
+    helpers.mark_tab(None, None)
+    helpers.name_session("shop")
+
+    assert sent == [{"meta": "mark_tab", "target_id": "t1", "mark": "deliverable"},
+                    {"meta": "mark_tab", "target_id": None, "mark": None},
+                    {"meta": "name_session", "name": "shop"}]
 
 
 def test_send_carries_the_owner(monkeypatch):
