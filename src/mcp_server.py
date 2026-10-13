@@ -38,6 +38,8 @@ from browser_harness.helpers import (
     http_get,
     js,
     list_tabs,
+    mark_tab,
+    name_session,
     new_tab,
     page_info,
     press_key,
@@ -227,8 +229,21 @@ def browser_close_tab(target: str | None = None):
 
 @_tool
 def browser_ensure_real_tab():
-    """Switch to a real (non-internal) tab if the current one is chrome:// or stale."""
+    """Return your current tab, opening your own background tab if you have none."""
     return ensure_real_tab()
+
+
+@_tool
+def browser_mark_tab(mark: str | None, target: str | None = None):
+    """Mark one of your tabs (default: the current one). "deliverable": it stays open for
+    the person when you are done. "handoff": the person should act in it now. null clears."""
+    return {"mark": mark_tab(target, mark)}
+
+
+@_tool
+def browser_name_session(name: str):
+    """Name your session; your tabs' titles show it to the person."""
+    return {"name": name_session(name)}
 
 
 @_tool
