@@ -394,21 +394,26 @@ def daemon_browser_kind(name=None):
     return kind if kind in {"cloud", "cdp", "local"} else None
 
 
-def _restart_if_outdated(name=None):
+def _restart_if_outdated(name=None, may_restart=True):
     """A daemon on another protocol is stopped only when no other agent uses it and it
     holds no Cloud browser; a newer client on the same protocol just uses it."""
     ping = _ping(name)
     have = ping.get("protocol", 1)
     if not ping.get("pong") or have == ipc.PROTOCOL:  # an unanswered ping is no reason to drop a healthy connection
         return False
-    if ping.get("active") or ping.get("browser_kind") == "cloud":
-        raise RuntimeError(
-            f"daemon-outdated: daemon {name or NAME!r} speaks protocol {have}, this client {ipc.PROTOCOL}. "
-            f"It was not restarted because {'its Cloud browser would stop' if ping.get('browser_kind') == 'cloud' else 'other agents are using it'}. "
-            "Nothing was sent. Retry when they finish, or run browser-harness --reload."
-        )
-    restart_daemon(name)
-    return True
+    if not may_restart:
+        why = "it must stay as provisioned"
+    elif ping.get("browser_kind") == "cloud":
+        why = "its Cloud browser would stop"
+    elif ping.get("active"):
+        why = "other agents are using it"
+    else:
+        restart_daemon(name)
+        return True
+    raise RuntimeError(
+        f"daemon-outdated: daemon {name or NAME!r} speaks protocol {have}, this client {ipc.PROTOCOL}. "
+        f"It was not restarted because {why}. Nothing was sent. Retry when they finish, or run browser-harness --reload."
+    )
 
 
 def _check_same_browser(name=None):
@@ -767,6 +772,7 @@ def require_existing_daemon(name=None):
     if not isinstance(resp, dict) or "result" not in resp:
         raise RuntimeError(f"required daemon {daemon_name!r} failed its CDP health check")
     _check_same_browser(daemon_name)
+    _restart_if_outdated(daemon_name, may_restart=False)
 
 
 def stop_remote_daemon(name="remote"):
