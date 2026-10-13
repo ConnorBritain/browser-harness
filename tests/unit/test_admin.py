@@ -220,6 +220,14 @@ def test_only_an_idle_daemon_on_another_protocol_restarts(monkeypatch, ping, out
         assert restarted == []
 
 
+def test_a_required_daemon_on_another_protocol_is_never_restarted(monkeypatch):
+    monkeypatch.setattr(admin, "_ping", lambda _name=None: {"pong": True, "protocol": 1, "active": 0})
+    monkeypatch.setattr(admin, "restart_daemon", lambda *a: pytest.fail("restarted a provisioned daemon"))
+
+    with pytest.raises(RuntimeError, match="daemon-outdated: .*because it must stay as provisioned"):
+        admin._restart_if_outdated("rig", may_restart=False)
+
+
 def test_cdp_daemons_spawn_under_the_lock_and_join_a_starting_one(tmp_path, monkeypatch):
     """Ten agents starting together on BU_CDP_URL share one daemon."""
     monkeypatch.setenv("BU_CDP_URL", "http://127.0.0.1:9555")
