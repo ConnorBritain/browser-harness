@@ -853,19 +853,61 @@ def test_ping_is_not_activity():
     assert d.last > 0
 
 
-@pytest.mark.parametrize(("name", "kind", "exits"), [
-    ("default", "local", False), ("work", "local", True), ("default", "cdp", True), ("remote", "cloud", True)])
-def test_idle_exit_spares_only_the_default_local_daemon(monkeypatch, name, kind, exits):
+@pytest.mark.parametrize(("name", "kind", "required", "exits"), [
+    ("work", "local", False, True), ("default", "cdp", False, True), ("rig", "cdp", False, True),
+    ("default", "local", False, False),  # Chrome would ask to Allow again
+    ("remote", "cloud", False, False),  # exit stops the paid browser and its logins
+    ("rig", "cdp", True, False), ("work", "local", True, False),  # an orchestrator requires it
+])
+def test_only_unused_named_local_and_cdp_daemons_idle_exit(monkeypatch, name, kind, required, exits):
     monkeypatch.setattr(daemon, "NAME", name)
     monkeypatch.setattr(daemon, "BROWSER_KIND", kind)
     monkeypatch.setattr(daemon, "log", lambda _m: None)
     d = _daemon()
     d.stop = asyncio.Event()
+    _run(d, {"meta": "ping", "keep": required})
     d.last = time.time() - daemon.IDLE_EXIT - 1
 
     asyncio.run(d.sweep())
 
     assert d.stop.is_set() is exits
+
+
+def test_a_daemon_started_under_require_existing_never_idle_exits(monkeypatch):
+    monkeypatch.setenv("BH_REQUIRE_EXISTING_DAEMON", "1")
+    assert daemon.Daemon().keep is True
+
+
+def test_idle_exit_releases_tabs_before_it_stops(monkeypatch):
+    """Review B2: stop was set first, so serve() cancelled the release at its first await."""
+    monkeypatch.setattr(daemon, "NAME", "work")
+    monkeypatch.setattr(daemon, "log", lambda _m: None)
+    monkeypatch.setattr(daemon.ipc, "cleanup_endpoint", lambda _n: None)
+    monkeypatch.setattr(daemon, "SWEEP_EVERY", 0.01)
+
+    async def serve_forever(*_a):
+        await asyncio.Event().wait()
+    monkeypatch.setattr(daemon.ipc, "serve", serve_forever)
+
+    async def go():
+        d = _daemon(PERSON)
+        d.stop = asyncio.Event()
+        for r in (cmd("a"), meta("a", "new_tab"), cmd("b"), meta("b", "new_tab")):
+            await d.handle(r)
+        real = d.cdp.send_raw
+
+        async def slow(method, params=None, session_id=None):
+            await asyncio.sleep(0)  # a real websocket round trip yields
+            return await real(method, params, session_id)
+        d.cdp.send_raw = slow
+        for o in d.owners.values():
+            o.seen = 0
+        d.last = 0
+        await asyncio.wait_for(daemon.serve(d), timeout=2)
+        return d
+    d = asyncio.run(go())
+
+    assert len(d.cdp.sent("Target.detachFromTarget")) == 2 and len(d.tab_owner) == 2
 
 
 def test_recent_activity_keeps_a_named_daemon(monkeypatch):

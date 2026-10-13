@@ -128,7 +128,7 @@ LOCAL_HANDSHAKE_TIMEOUT = None
 NO_TOGGLE_GRACE = 3
 TOGGLE_BOOT_GRACE = 12
 OWNER_IDLE = float(os.environ.get("BH_OWNER_IDLE", 1800))  # seconds before an idle owner's tabs are released
-IDLE_EXIT = float(os.environ.get("BH_IDLE_EXIT", 1800))  # seconds before a named, CDP or cloud daemon exits
+IDLE_EXIT = float(os.environ.get("BH_IDLE_EXIT", 1800))  # seconds before an unused named local or CDP daemon exits
 SWEEP_EVERY = min(60, OWNER_IDLE, IDLE_EXIT)
 MARKS = {"deliverable": "\U0001F4CC", "handoff": "✋"}  # pin: stays for the person; raised hand: person acts now
 
@@ -445,6 +445,7 @@ class Daemon:
         self.info = {}           # target_id -> latest targetInfo
         self.stop = None         # asyncio.Event, set inside start()
         self.last = time.time()  # last request other than ping
+        self.keep = os.environ.get("BH_REQUIRE_EXISTING_DAEMON") == "1"  # provisioned: never idle-exit
 
     def owner(self, key):
         o = self.owners.setdefault(key, Owner())
@@ -586,11 +587,9 @@ class Daemon:
 
     async def sweep(self):
         """Release owners idle longer than OWNER_IDLE; forget idle owners with no tabs.
-        A named, CDP or cloud daemon exits after IDLE_EXIT without requests; the default
-        local one stays while Chrome is up, so Chrome never asks to Allow it again."""
-        if (NAME != "default" or BROWSER_KIND != "local") and time.time() - self.last > IDLE_EXIT:
-            log(f"idle for {IDLE_EXIT:g}s, exiting")
-            self.stop.set()
+        Then a named local or CDP daemon exits after IDLE_EXIT without requests. Never the
+        default local one (Chrome would ask to Allow again), never a Cloud one (exit stops
+        the browser), never one a client requires to exist."""
         for key, o in list(self.owners.items()):
             if time.time() - o.seen <= OWNER_IDLE:
                 continue
@@ -600,6 +599,10 @@ class Daemon:
             async with o.lock:  # never under a command that is attaching or opening a tab
                 if time.time() - o.seen > OWNER_IDLE:  # the owner may have come back meanwhile
                     await self._release(key, o)
+        may_exit = BROWSER_KIND == "cdp" or (BROWSER_KIND == "local" and NAME != "default")
+        if may_exit and not self.keep and time.time() - self.last > IDLE_EXIT:
+            log(f"idle for {IDLE_EXIT:g}s, exiting")
+            self.stop.set()
 
     async def _close_inspect_tabs(self, targets):
         """Close chrome://inspect tabs left open by the permission recovery flow"""
@@ -726,6 +729,7 @@ class Daemon:
         # `pid` lets restart_daemon() verify the live daemon's identity before
         # signaling — protects against SIGTERM-by-stale-pid-file after PID reuse.
         if meta == "ping":
+            self.keep = self.keep or bool(req.get("keep"))
             # `active` counts the other owners still using the daemon, so a protocol bump never restarts it under them.
             active = sum(k != req.get("owner") and bool(o.tabs) and time.time() - o.seen < OWNER_IDLE for k, o in self.owners.items())
             return {"pong": True, "pid": os.getpid(), "browser_kind": BROWSER_KIND, "endpoint": ipc.endpoint_label(),

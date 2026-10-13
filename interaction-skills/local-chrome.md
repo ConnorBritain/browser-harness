@@ -10,6 +10,12 @@ command on another owner's tab fails with `tab-taken`. Sub-agents need their own
 `BH_OWNER`, since they inherit their parent's session id. Do not create another
 local daemon for isolation: it adds another Allow prompt and isolates nothing more.
 
+Timers, in seconds, set in the daemon's environment:
+
+- `BH_OWNER_IDLE` (1800): after this long without a command, an agent's tabs other than its current one are given back (left open; unmarked ones get a clean title), and its current tab can be taken by another agent.
+- `BH_CLOSE_IDLE_TABS=1`: also close the unmarked tabs the idle agent opened itself. Off by default.
+- `BH_IDLE_EXIT` (1800): an unused named local or `BU_CDP_URL` daemon exits. The default local daemon, Cloud daemons, and daemons used with `BH_REQUIRE_EXISTING_DAEMON=1` never exit on idle.
+
 A command timeout, truncated output, site change, closed tab, or new task is not
 a reason to restart the daemon. Updating browser-harness does not restart it
 either. Run `browser-harness --doctor` and restart it only when it is actually
