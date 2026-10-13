@@ -572,6 +572,16 @@ class Daemon:
                 raise RuntimeError(self._closed(o, tid))
             return sid  # never None: a command without a session would run at browser level
 
+    async def _focus(self, o, tid):
+        """Make tid the owner's current tab. Only the current tab streams Network events, so a
+        busy background tab cannot push the current tab's events out of the owner's ring."""
+        old, o.current = o.current, tid
+        if old != tid:
+            await asyncio.gather(*(
+                _silent(asyncio.wait_for(self.cdp.send_raw(f"Network.{verb}", session_id=sid), timeout=2))
+                for verb, sid in (("disable", o.tabs.get(old)), ("enable", o.tabs.get(tid))) if sid))
+        self._save()
+
     def _mark(self, key, tid, prefix=None):
         """Show in the tab title which agent holds it and its mark, off the synchronous IPC path."""
         o = self.owners[key]
@@ -828,8 +838,7 @@ class Daemon:
             o.gone = None
             self._take(key, tid, current=False)
             sid = await self._session(key, o, tid)  # the current tab moves only once the new one is attached
-            o.current = tid
-            self._save()
+            await self._focus(o, tid)
             if req.get("activate"):
                 await self.cdp.send_raw("Target.activateTarget", {"targetId": tid})
             return {"target_id": tid, "session_id": sid}
@@ -838,8 +847,10 @@ class Daemon:
             reuse = req.get("reuse") and o.current and is_blank(self.info.get(o.current, {}).get("url", "-"))
             tid = o.current if reuse else (await self.cdp.send_raw(
                 "Target.createTarget", {"url": "about:blank", "background": True}))["targetId"]
-            self._own(key, tid, created=not reuse)
-            return {"target_id": tid, "session_id": await self._session(key, o, tid)}
+            self._own(key, tid, current=False, created=not reuse)
+            sid = await self._session(key, o, tid)
+            await self._focus(o, tid)
+            return {"target_id": tid, "session_id": sid}
         if meta not in ("session", "current_tab"):
             return {"error": f"unknown request {meta!r}: this daemon speaks protocol {ipc.PROTOCOL}; update browser-harness"}
         if o.gone:

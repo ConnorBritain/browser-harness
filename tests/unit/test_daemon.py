@@ -816,6 +816,22 @@ def test_sweep_keeps_active_owners_and_forgets_idle_empty_ones():
     assert list(d.owners) == ["a"] and d.tab_owner == {"tab-1": "a"}
 
 
+def test_only_the_current_tab_streams_network_events():
+    """Review S10: a chatty background tab must not push the current tab's events out of the ring."""
+    d = _daemon(PERSON)
+    _run(d, cmd("a"))
+    first = d.owners["a"].tabs["tab-1"]
+    d.cdp.calls.clear()
+
+    _run(d, meta("a", "new_tab"))
+    second = d.owners["a"].tabs["tab-3"]
+    _run(d, meta("a", "switch_tab", target_id="tab-1"), meta("a", "switch_tab", target_id="tab-1"))
+
+    assert [(m, s) for m, _p, s in d.cdp.calls if m == "Network.disable"] == [("Network.disable", first), ("Network.disable", second)]
+    assert [s for m, _p, s in d.cdp.calls if m == "Network.enable"][-1] == first
+    assert d.owners["a"].current == "tab-1"
+
+
 def test_enable_default_domains_runs_four_enables_in_parallel():
     class _Probe(_Browser):
         def __init__(self):
