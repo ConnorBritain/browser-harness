@@ -17,7 +17,8 @@ def fake_png():
 
 
 @pytest.fixture(autouse=True)
-def _owner_state_in_tmp(tmp_path, monkeypatch):
-    """Daemon tests must never write the real runtime dir's owner state."""
-    from browser_harness import daemon
+def _runtime_in_tmp(tmp_path, monkeypatch):
+    """Tests must never write or sweep the real runtime dir."""
+    from browser_harness import _ipc, daemon
     monkeypatch.setattr(daemon, "STATE", tmp_path / "owners.json")
+    monkeypatch.setattr(_ipc, "_RUNTIME", tmp_path)
