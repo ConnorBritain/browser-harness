@@ -376,7 +376,9 @@ def _ping(name=None):
     c = None
     try:
         c, token = ipc.connect(name or NAME, timeout=1.0)
-        response = ipc.request(c, token, {"meta": "ping", "owner": ipc.owner()})
+        # `keep` tells a provisioned daemon that its clients require it, so it never idle-exits.
+        response = ipc.request(c, token, {"meta": "ping", "owner": ipc.owner(),
+                                          "keep": os.environ.get("BH_REQUIRE_EXISTING_DAEMON") == "1"})
         return response if isinstance(response, dict) else {}
     except (FileNotFoundError, ConnectionRefusedError, TimeoutError, socket.timeout, OSError, ValueError):
         return {}
